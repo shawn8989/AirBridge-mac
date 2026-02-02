@@ -1,0 +1,70 @@
+# Xcode
+.DS_Store
+build/
+DerivedData/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+xcuserdata/
+*.xcscmblueprint
+*.pbxuser
+*.perspectivev3
+*.mode1v3
+*.mode2v3
+*.xccheckout
+*.xcscm
+*.hmap
+*.ipa
+*.app
+*.dSYM
+*.o
+*.linkfilelist
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# CocoaPods
+Pods/
+
+# Carthage
+Carthage/Build/
+
+# fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots
+
+# Secrets and signing
+*.mobileprovision
+*.p12
+*.key
+*.keystore
+*.jks
+*.cer
+*.der
+.env
+.env.*
+
+# macOS
+*.DS_Store
+
+# Logs
+*.log
+
+# Temporary files
+*.swp
+*~
+
+# Ignore Xcode user files
+*.xcuserdatad
+*.xcuserdata
+
+# Ignore compiled executables
+*.out
+
+# Ignore large assets if any
+*.xcassets/*.appiconset/*
+
+# Ignore workspace state
+WorkspaceSettings.xcsettings
+xcshareddata/WorkspaceSettings.xcsettings

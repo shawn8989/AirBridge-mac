@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required capabilities -->
+    <key>com.apple.security.network.server</key>
+    <true/>
+    <key>com.apple.security.personal-information.keychain</key>
+    <true/>
+
+    <!-- Accessibility temporary exception (only used if sandboxed and required for CGEvent workflows) -->
+    <key>com.apple.security.temporary-exception.mach-lookup.global-name</key>
+    <array>
+        <string>com.apple.axserver</string>
+    </array>
+
+    <!-- Explicit denials -->
+    <key>com.apple.security.files.user-selected.read-only</key>
+    <false/>
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <false/>
+    <key>com.apple.security.files.downloads.read-write</key>
+    <false/>
+    <key>com.apple.security.files.all</key>
+    <false/>
+    <key>com.apple.security.device.camera</key>
+    <false/>
+    <key>com.apple.security.device.microphone</key>
+    <false/>
+    <key>com.apple.security.automation.apple-events</key>
+    <false/>
+</dict>
+</plist>
