@@ -134,17 +134,13 @@ final class NetworkManager {
     }
 
     private func _start() {
-        // TLS-PSK listener (Stage 2a): the server resolves a per-device key from
-        // the client's offered identity (its device ID) via a selection block.
-        // Paired devices use their stored key; not-yet-paired devices fall back
-        // to the Stage 1 shared key so existing clients keep working until the
-        // pairing flow (Stage 2b) lands.
-        let params = AirSecureChannel.makeServerPSKParameters(queue: queue) { [weak self] identity in
-            if let self, let key = try? self.security.loadSharedSecret(for: identity) {
-                return key
-            }
-            return AirSecureChannel.stage1PSK
-        }
+        // Shared-key TLS-PSK listener (known-working transport). The server-side
+        // per-device PSK *selection block* did not complete the TLS handshake in
+        // practice, so the channel uses one shared key for encryption and we
+        // enforce per-device authentication at the application layer after connect
+        // (Stage 2b) instead of via the TLS PSK identity.
+        let params = AirSecureChannel.makePSKParameters(psk: AirSecureChannel.stage1PSK,
+                                                        identity: AirSecureChannel.stage1Identity)
         params.includePeerToPeer = false
 
         do {
