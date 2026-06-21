@@ -25,6 +25,10 @@ private final class ConnectionBox {
     var deviceID: String?   // Added property for deviceID
     var scrollAccumX: Double = 0
     var scrollAccumY: Double = 0
+    // App-layer authentication state. Commands are only executed once the
+    // connection has proven knowledge of the device's shared secret.
+    var authenticated = false
+    var authNonce: Data?
     init(secret: Data) { self.pendingSecret = secret }
 }
 
@@ -220,21 +224,40 @@ final class NetworkManager {
             guard let dict = obj as? [String: Any], let type = dict["type"] as? String else {
                 throw NSError(domain: "AirBridge", code: -1, userInfo: [NSLocalizedDescriptionKey: "Missing type field"])
             }
+            // Gate all functional messages until the connection has proven
+            // knowledge of the device's per-device shared secret via the
+            // challenge-response below. Only handshake messages are allowed
+            // before authentication, so an unauthenticated peer can neither
+            // inject input nor read system/app information.
+            let openTypes: Set<String> = ["hello", "pair_request", "auth_proof"]
+            if !openTypes.contains(type) && !box.authenticated {
+                return
+            }
             switch type {
             case "hello":
                 if let payload = dict["payload"] as? [String: Any], let deviceID = payload["deviceID"] as? String {
                     box.deviceID = deviceID
                     // Attempt to load existing secret
                     if let _ = try? self.security.loadSharedSecret(for: deviceID) {
-                        // Known device: notify connected
-                        self.onDeviceConnected(deviceID)
+                        // Known device: require proof it holds the shared secret
+                        // before authorizing. A device ID alone is not secret, so
+                        // it is not sufficient — issue a random challenge.
+                        let nonce = self.security.generateNonce(length: 32)
+                        box.authNonce = nonce
+                        self.sendLine(connection, jsonObject: [
+                            "type": "auth_challenge",
+                            "payload": ["nonce": nonce.base64EncodedString()]
+                        ])
                     } else {
-                        // Unknown device: ask user asynchronously
+                        // Unknown device: ask the user to approve first-time pairing.
                         Task { [weak self] in
                             guard let self else { return }
                             let allowed = await self.onUnknownDevice(deviceID, box.pendingSecret)
                             if allowed {
-                                // UI will persist secret via AppState; just notify connected
+                                // First-time pairing is trusted via explicit user
+                                // approval, and the secret was exchanged over the
+                                // encrypted channel — authorize this connection.
+                                box.authenticated = true
                                 self.onDeviceConnected(deviceID)
                             } else {
                                 self.sendError("Pairing denied for \(deviceID)", to: connection)
@@ -244,6 +267,27 @@ final class NetworkManager {
                     }
                 } else {
                     self.sendError("hello missing payload.deviceID", to: connection)
+                }
+            case "auth_proof":
+                // Verify the device knows its shared secret: HMAC(secret, nonce).
+                guard let payload = dict["payload"] as? [String: Any],
+                      let proofB64 = payload["proof"] as? String,
+                      let proof = Data(base64Encoded: proofB64),
+                      let deviceID = box.deviceID,
+                      let nonce = box.authNonce,
+                      let secret = try? self.security.loadSharedSecret(for: deviceID) else {
+                    self.sendError("auth_proof: missing fields or unknown device", to: connection)
+                    connection.cancel()
+                    break
+                }
+                let expected = self.security.computeHMAC(secret: secret, data: nonce)
+                if expected == proof {
+                    box.authenticated = true
+                    box.authNonce = nil
+                    self.onDeviceConnected(deviceID)
+                } else {
+                    self.sendError("authentication failed", to: connection)
+                    connection.cancel()
                 }
             case "mouse_down":
                 if let payload = dict["payload"] as? [String: Any], let button = payload["button"] as? String {
