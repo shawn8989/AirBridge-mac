@@ -89,7 +89,7 @@ private final class ScreenCaptureHelper: NSObject, SCStreamOutput, SCStreamDeleg
 
 final class NetworkManager {
     typealias PacketHandler = @Sendable (AirPacket) async -> Void
-    typealias UnknownDeviceHandler = @Sendable (_ deviceID: String, _ proposedSecret: Data) async -> Bool
+    typealias UnknownDeviceHandler = @Sendable (_ deviceID: String, _ proposedSecret: Data, _ decide: @escaping @Sendable (Bool) -> Void) -> Void
 
     private let queue = DispatchQueue(label: "AirBridge.Network")
     private var listener: NWListener?
@@ -250,16 +250,15 @@ final class NetworkManager {
                         ])
                     } else {
                         // Unknown device: ask the user to approve first-time pairing.
-                        // Capture only Sendable values (NOT the non-Sendable box) in
-                        // the Task — capturing the box corrupts the closure context
-                        // and crashes. Re-acquire the box on the network queue after
-                        // the async decision returns.
+                        // Capture only Sendable values (NOT the non-Sendable box).
+                        // onUnknownDevice is a plain completion-style callback (no
+                        // async value crossing the actor boundary) — the previous
+                        // async/@MainActor-isolated closure corrupted its arguments.
                         let pendingDeviceID = deviceID
                         let pendingSecret = box.pendingSecret
                         let connKey = ObjectIdentifier(connection)
-                        Task { [weak self] in
+                        self.onUnknownDevice(pendingDeviceID, pendingSecret) { [weak self] allowed in
                             guard let self else { return }
-                            let allowed = await self.onUnknownDevice(pendingDeviceID, pendingSecret)
                             self.queue.async {
                                 if allowed {
                                     // First-time pairing is trusted via explicit user
