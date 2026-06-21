@@ -354,7 +354,8 @@ public enum AirSecureChannel {
         let sec = tls.securityProtocolOptions
         configurePSKCommon(sec)
         sec_protocol_options_set_pre_shared_key_selection_block(sec, { _, pskIdentity, complete in
-            let identityData = Data(pskIdentity)
+            guard let pskIdentity else { complete(nil); return }
+            let identityData = Data(pskIdentity as DispatchData)
             let identity = String(decoding: identityData, as: UTF8.self)
             if let key = keyForIdentity(identity) {
                 complete(dispatchData(key) as __DispatchData)
