@@ -286,7 +286,12 @@ final class NetworkManager {
                     box.authNonce = nil
                     self.onDeviceConnected(deviceID)
                 } else {
-                    self.sendError("authentication failed", to: connection)
+                    // Secret mismatch — almost always a stale pairing from earlier
+                    // runs. Forget the stored secret and tell the client to reset,
+                    // so the next connection performs a fresh pairing (with the
+                    // approval prompt) instead of failing forever.
+                    self.security.deleteSharedSecret(for: deviceID)
+                    self.sendLine(connection, jsonObject: ["type": "auth_reset", "message": "Re-pair required"])
                     connection.cancel()
                 }
             case "mouse_down":
