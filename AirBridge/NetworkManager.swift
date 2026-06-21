@@ -134,13 +134,15 @@ final class NetworkManager {
     }
 
     private func _start() {
-        // Plain TCP listener (no TLS) to align with iOS client during bring-up
-        let params = NWParameters.tcp
-        params.allowLocalEndpointReuse = true
+        // TLS-PSK listener (Stage 1): encrypted + mutually authenticated channel
+        // using a shared pre-shared key. Stage 2 replaces the hardcoded key with
+        // per-device keys established out-of-band during pairing.
+        let params = AirSecureChannel.makePSKParameters(psk: AirSecureChannel.stage1PSK,
+                                                        identity: AirSecureChannel.stage1Identity)
         params.includePeerToPeer = false
 
         do {
-            let listener = try NWListener(using: .tcp, on: 0)
+            let listener = try NWListener(using: params, on: 0)
             self.listener = listener
             listener.service = NWListener.Service(name: "AirBridge", type: "_airbridge._tcp")
             listener.stateUpdateHandler = { [weak self] state in

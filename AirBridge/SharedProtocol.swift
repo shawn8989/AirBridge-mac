@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import Network
 
 /// A Codable enum representing a value that can be String, Int, or Double.
 /// Encodes and decodes using a single value container.
@@ -296,4 +297,48 @@ public func canonicalJSONEncoder() -> JSONEncoder {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
     return encoder
+}
+
+/// Builds the secure (TLS-PSK) transport shared by AirPad and AirBridge.
+///
+/// We use an external TLS pre-shared key rather than certificates: it gives
+/// confidentiality *and* mutual authentication (both peers must hold the same
+/// key) in one step, with no certificate provisioning. The PSK `identity` is how
+/// the server will look up the correct per-device key in Stage 2; in Stage 1 a
+/// single hardcoded key is used on both sides purely to validate the channel.
+public enum AirSecureChannel {
+    /// STAGE 1 ONLY — temporary shared key/identity used to prove the encrypted
+    /// channel end-to-end. Stage 2 replaces this with per-device keys exchanged
+    /// out-of-band (QR / pairing code), so this constant goes away entirely.
+    public static let stage1Identity = "airbridge-stage1"
+    public static let stage1PSK: Data = Data("airbridge-stage1-temporary-psk-please-replace".utf8)
+
+    /// Construct `NWParameters` for a TLS-PSK channel. Works for both the client
+    /// (connection) and the server (listener) — PSK setup is symmetric.
+    ///
+    /// External PSK requires TLS 1.2 with a PSK ciphersuite; TLS 1.3 in
+    /// Network.framework only supports resumption PSKs, not external ones.
+    public static func makePSKParameters(psk: Data, identity: String) -> NWParameters {
+        let tls = NWProtocolTLS.Options()
+        let sec = tls.securityProtocolOptions
+
+        sec_protocol_options_set_min_tls_protocol_version(sec, .TLSv12)
+        sec_protocol_options_set_max_tls_protocol_version(sec, .TLSv12)
+
+        let pskData = psk.withUnsafeBytes { DispatchData(bytes: $0) }
+        let identityData = Data(identity.utf8).withUnsafeBytes { DispatchData(bytes: $0) }
+        sec_protocol_options_add_pre_shared_key(sec,
+                                                pskData as __DispatchData,
+                                                identityData as __DispatchData)
+
+        // TLS_PSK_WITH_AES_128_GCM_SHA256 (0x00A8) — use the raw value so this
+        // compiles regardless of SDK enum-case naming differences.
+        if let suite = tls_ciphersuite_t(rawValue: 0x00A8) {
+            sec_protocol_options_append_tls_ciphersuite(sec, suite)
+        }
+
+        let params = NWParameters(tls: tls)
+        params.allowLocalEndpointReuse = true
+        return params
+    }
 }
