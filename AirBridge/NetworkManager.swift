@@ -25,6 +25,10 @@ private final class ConnectionBox {
     var deviceID: String?   // Added property for deviceID
     var scrollAccumX: Double = 0
     var scrollAccumY: Double = 0
+    // App-layer authentication state. Commands are only executed once the
+    // connection has proven knowledge of the device's shared secret.
+    var authenticated = false
+    var authNonce: Data?
     init(secret: Data) { self.pendingSecret = secret }
 }
 
@@ -85,7 +89,7 @@ private final class ScreenCaptureHelper: NSObject, SCStreamOutput, SCStreamDeleg
 
 final class NetworkManager {
     typealias PacketHandler = @Sendable (AirPacket) async -> Void
-    typealias UnknownDeviceHandler = @Sendable (_ deviceID: String, _ proposedSecret: Data) async -> Bool
+    typealias UnknownDeviceHandler = @Sendable (_ deviceID: String, _ proposedSecret: Data, _ decide: @escaping @Sendable (Bool) -> Void) -> Void
 
     private let queue = DispatchQueue(label: "AirBridge.Network")
     private var listener: NWListener?
@@ -134,13 +138,17 @@ final class NetworkManager {
     }
 
     private func _start() {
-        // Plain TCP listener (no TLS) to align with iOS client during bring-up
-        let params = NWParameters.tcp
-        params.allowLocalEndpointReuse = true
+        // Shared-key TLS-PSK listener (known-working transport). The server-side
+        // per-device PSK *selection block* did not complete the TLS handshake in
+        // practice, so the channel uses one shared key for encryption and we
+        // enforce per-device authentication at the application layer after connect
+        // (Stage 2b) instead of via the TLS PSK identity.
+        let params = AirSecureChannel.makePSKParameters(psk: AirSecureChannel.stage1PSK,
+                                                        identity: AirSecureChannel.stage1Identity)
         params.includePeerToPeer = false
 
         do {
-            let listener = try NWListener(using: .tcp, on: 0)
+            let listener = try NWListener(using: params, on: 0)
             self.listener = listener
             listener.service = NWListener.Service(name: "AirBridge", type: "_airbridge._tcp")
             listener.stateUpdateHandler = { [weak self] state in
@@ -216,30 +224,83 @@ final class NetworkManager {
             guard let dict = obj as? [String: Any], let type = dict["type"] as? String else {
                 throw NSError(domain: "AirBridge", code: -1, userInfo: [NSLocalizedDescriptionKey: "Missing type field"])
             }
+            // Gate all functional messages until the connection has proven
+            // knowledge of the device's per-device shared secret via the
+            // challenge-response below. Only handshake messages are allowed
+            // before authentication, so an unauthenticated peer can neither
+            // inject input nor read system/app information.
+            let openTypes: Set<String> = ["hello", "pair_request", "auth_proof"]
+            if !openTypes.contains(type) && !box.authenticated {
+                return
+            }
             switch type {
             case "hello":
                 if let payload = dict["payload"] as? [String: Any], let deviceID = payload["deviceID"] as? String {
                     box.deviceID = deviceID
                     // Attempt to load existing secret
                     if let _ = try? self.security.loadSharedSecret(for: deviceID) {
-                        // Known device: notify connected
-                        self.onDeviceConnected(deviceID)
+                        // Known device: require proof it holds the shared secret
+                        // before authorizing. A device ID alone is not secret, so
+                        // it is not sufficient — issue a random challenge.
+                        let nonce = self.security.generateNonce(length: 32)
+                        box.authNonce = nonce
+                        self.sendLine(connection, jsonObject: [
+                            "type": "auth_challenge",
+                            "payload": ["nonce": nonce.base64EncodedString()]
+                        ])
                     } else {
-                        // Unknown device: ask user asynchronously
-                        Task { [weak self] in
+                        // Unknown device: ask the user to approve first-time pairing.
+                        // Capture only Sendable values (NOT the non-Sendable box).
+                        // onUnknownDevice is a plain completion-style callback (no
+                        // async value crossing the actor boundary) — the previous
+                        // async/@MainActor-isolated closure corrupted its arguments.
+                        let pendingDeviceID = deviceID
+                        let pendingSecret = box.pendingSecret
+                        let connKey = ObjectIdentifier(connection)
+                        self.onUnknownDevice(pendingDeviceID, pendingSecret) { [weak self] allowed in
                             guard let self else { return }
-                            let allowed = await self.onUnknownDevice(deviceID, box.pendingSecret)
-                            if allowed {
-                                // UI will persist secret via AppState; just notify connected
-                                self.onDeviceConnected(deviceID)
-                            } else {
-                                self.sendError("Pairing denied for \(deviceID)", to: connection)
-                                connection.cancel()
+                            self.queue.async {
+                                if allowed {
+                                    // First-time pairing is trusted via explicit user
+                                    // approval; the secret was exchanged over the
+                                    // encrypted channel — authorize this connection.
+                                    self.connectionBoxes[connKey]?.authenticated = true
+                                    self.onDeviceConnected(pendingDeviceID)
+                                } else {
+                                    self.sendError("Pairing denied for \(pendingDeviceID)", to: connection)
+                                    connection.cancel()
+                                }
                             }
                         }
                     }
                 } else {
                     self.sendError("hello missing payload.deviceID", to: connection)
+                }
+            case "auth_proof":
+                // Verify the device knows its shared secret: HMAC(secret, nonce).
+                guard let payload = dict["payload"] as? [String: Any],
+                      let proofB64 = payload["proof"] as? String,
+                      let proof = Data(base64Encoded: proofB64),
+                      let deviceID = box.deviceID,
+                      let nonce = box.authNonce,
+                      let secret = try? self.security.loadSharedSecret(for: deviceID) else {
+                    self.sendError("auth_proof: missing fields or unknown device", to: connection)
+                    connection.cancel()
+                    break
+                }
+                let expected = self.security.computeHMAC(secret: secret, data: nonce)
+                if expected == proof {
+                    box.authenticated = true
+                    box.authNonce = nil
+                    self.onDeviceConnected(deviceID)
+                } else {
+                    // Secret mismatch — almost always a stale pairing from earlier
+                    // runs. Forget the stored secret and tell the client to reset,
+                    // so the next connection performs a fresh pairing (with the
+                    // approval prompt) instead of failing forever.
+                    self.security.deleteSharedSecret(for: deviceID)
+                    self.sendLine(connection, jsonObject: ["type": "auth_reset", "message": "Re-pair required"])
+                    connection.cancel()
                 }
             case "mouse_down":
                 if let payload = dict["payload"] as? [String: Any], let button = payload["button"] as? String {

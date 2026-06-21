@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import Network
 
 /// A Codable enum representing a value that can be String, Int, or Double.
 /// Encodes and decodes using a single value container.
@@ -296,4 +297,78 @@ public func canonicalJSONEncoder() -> JSONEncoder {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
     return encoder
+}
+
+/// Builds the secure (TLS-PSK) transport shared by AirPad and AirBridge.
+///
+/// We use an external TLS pre-shared key rather than certificates: it gives
+/// confidentiality *and* mutual authentication (both peers must hold the same
+/// key) in one step, with no certificate provisioning. The PSK `identity` is how
+/// the server will look up the correct per-device key in Stage 2; in Stage 1 a
+/// single hardcoded key is used on both sides purely to validate the channel.
+public enum AirSecureChannel {
+    /// STAGE 1 ONLY — temporary shared key/identity used to prove the encrypted
+    /// channel end-to-end. Stage 2 replaces this with per-device keys exchanged
+    /// out-of-band (QR / pairing code), so this constant goes away entirely.
+    public static let stage1Identity = "airbridge-stage1"
+    public static let stage1PSK: Data = Data("airbridge-stage1-temporary-psk-please-replace".utf8)
+
+    /// Common TLS config for external PSK: pin TLS 1.2 and offer a PSK ciphersuite.
+    private static func configurePSKCommon(_ sec: sec_protocol_options_t) {
+        sec_protocol_options_set_min_tls_protocol_version(sec, .TLSv12)
+        sec_protocol_options_set_max_tls_protocol_version(sec, .TLSv12)
+        // TLS_PSK_WITH_AES_128_GCM_SHA256 (0x00A8) — raw value so this compiles
+        // regardless of SDK enum-case naming differences.
+        if let suite = tls_ciphersuite_t(rawValue: 0x00A8) {
+            sec_protocol_options_append_tls_ciphersuite(sec, suite)
+        }
+    }
+
+    private static func dispatchData(_ data: Data) -> DispatchData {
+        data.withUnsafeBytes { DispatchData(bytes: $0) }
+    }
+
+    /// Client side: offer a single (psk, identity). The identity is this device's
+    /// ID so the server can select the matching per-device key.
+    public static func makePSKParameters(psk: Data, identity: String) -> NWParameters {
+        let tls = NWProtocolTLS.Options()
+        let sec = tls.securityProtocolOptions
+        configurePSKCommon(sec)
+        sec_protocol_options_add_pre_shared_key(sec,
+                                                dispatchData(psk) as __DispatchData,
+                                                dispatchData(Data(identity.utf8)) as __DispatchData)
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true   // disable Nagle's algorithm for low-latency real-time input
+        let params = NWParameters(tls: tls, tcp: tcp)
+        params.allowLocalEndpointReuse = true
+        return params
+    }
+
+    /// Server side: resolve the PSK per connecting client via its offered identity
+    /// (the client's device ID). Return nil from `keyForIdentity` to reject.
+    ///
+    /// NOTE: the dispatch_data <-> Data bridging in the selection block is the
+    /// part most likely to need an SDK-specific tweak; adjust if the compiler
+    /// reports a different parameter type for `pskIdentity`.
+    public static func makeServerPSKParameters(queue: DispatchQueue,
+                                               keyForIdentity: @escaping (String) -> Data?) -> NWParameters {
+        let tls = NWProtocolTLS.Options()
+        let sec = tls.securityProtocolOptions
+        configurePSKCommon(sec)
+        sec_protocol_options_set_pre_shared_key_selection_block(sec, { _, pskIdentity, complete in
+            guard let pskIdentity else { complete(nil); return }
+            let identityData = Data(pskIdentity as DispatchData)
+            let identity = String(decoding: identityData, as: UTF8.self)
+            if let key = keyForIdentity(identity) {
+                complete(dispatchData(key) as __DispatchData)
+            } else {
+                complete(nil)
+            }
+        }, queue)
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true   // disable Nagle's algorithm for low-latency real-time input
+        let params = NWParameters(tls: tls, tcp: tcp)
+        params.allowLocalEndpointReuse = true
+        return params
+    }
 }

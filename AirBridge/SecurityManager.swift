@@ -40,8 +40,7 @@ final class SecurityManager {
         guard status == errSecSuccess else { throw SecurityError.keychainFailure(status) }
     }
 
-    func loadSharedSecret(for deviceID: String) throws -> Data {
-        let query: [String: Any] = [
+    func loadSharedSecret(for deviceID: String) throws -> Data {        let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: deviceID,
@@ -52,6 +51,17 @@ final class SecurityManager {
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         guard status == errSecSuccess, let data = result as? Data else { throw SecurityError.missingSecret }
         return data
+    }
+
+    /// Removes the stored shared secret for a device, e.g. after an auth failure
+    /// so the next connection performs a fresh pairing.
+    func deleteSharedSecret(for deviceID: String) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: deviceID
+        ]
+        SecItemDelete(query as CFDictionary)
     }
 
     // Compute HMAC-SHA256 over canonical JSON payload bytes

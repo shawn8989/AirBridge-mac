@@ -38,8 +38,16 @@ final class AppState: ObservableObject {
             onReceivePacket: { [weak self] packet in
                 await self?.handle(packet: packet)
             },
-            onUnknownDevice: { [weak self] deviceID, proposedSecret in
-                return await self?.promptPairing(deviceID: deviceID, proposedSecret: proposedSecret) ?? false
+            onUnknownDevice: { [weak self] deviceID, proposedSecret, decide in
+                // Plain (non-async, non-isolated) callback that hops to the main
+                // actor explicitly. Returning a value from an async @MainActor
+                // closure here corrupted its arguments; this pattern matches the
+                // other callbacks and is safe.
+                Task { @MainActor in
+                    guard let self else { decide(false); return }
+                    let allowed = await self.promptPairing(deviceID: deviceID, proposedSecret: proposedSecret)
+                    decide(allowed)
+                }
             },
             onDeviceConnected: { [weak self] deviceID in
                 Task { @MainActor in
