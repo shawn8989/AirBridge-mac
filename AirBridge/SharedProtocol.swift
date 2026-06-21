@@ -337,7 +337,9 @@ public enum AirSecureChannel {
         sec_protocol_options_add_pre_shared_key(sec,
                                                 dispatchData(psk) as __DispatchData,
                                                 dispatchData(Data(identity.utf8)) as __DispatchData)
-        let params = NWParameters(tls: tls)
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true   // disable Nagle's algorithm for low-latency real-time input
+        let params = NWParameters(tls: tls, tcp: tcp)
         params.allowLocalEndpointReuse = true
         return params
     }
@@ -363,7 +365,9 @@ public enum AirSecureChannel {
                 complete(nil)
             }
         }, queue)
-        let params = NWParameters(tls: tls)
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true   // disable Nagle's algorithm for low-latency real-time input
+        let params = NWParameters(tls: tls, tcp: tcp)
         params.allowLocalEndpointReuse = true
         return params
     }
