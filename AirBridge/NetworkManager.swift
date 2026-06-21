@@ -250,18 +250,27 @@ final class NetworkManager {
                         ])
                     } else {
                         // Unknown device: ask the user to approve first-time pairing.
+                        // Capture only Sendable values (NOT the non-Sendable box) in
+                        // the Task — capturing the box corrupts the closure context
+                        // and crashes. Re-acquire the box on the network queue after
+                        // the async decision returns.
+                        let pendingDeviceID = deviceID
+                        let pendingSecret = box.pendingSecret
+                        let connKey = ObjectIdentifier(connection)
                         Task { [weak self] in
                             guard let self else { return }
-                            let allowed = await self.onUnknownDevice(deviceID, box.pendingSecret)
-                            if allowed {
-                                // First-time pairing is trusted via explicit user
-                                // approval, and the secret was exchanged over the
-                                // encrypted channel — authorize this connection.
-                                box.authenticated = true
-                                self.onDeviceConnected(deviceID)
-                            } else {
-                                self.sendError("Pairing denied for \(deviceID)", to: connection)
-                                connection.cancel()
+                            let allowed = await self.onUnknownDevice(pendingDeviceID, pendingSecret)
+                            self.queue.async {
+                                if allowed {
+                                    // First-time pairing is trusted via explicit user
+                                    // approval; the secret was exchanged over the
+                                    // encrypted channel — authorize this connection.
+                                    self.connectionBoxes[connKey]?.authenticated = true
+                                    self.onDeviceConnected(pendingDeviceID)
+                                } else {
+                                    self.sendError("Pairing denied for \(pendingDeviceID)", to: connection)
+                                    connection.cancel()
+                                }
                             }
                         }
                     }
