@@ -200,8 +200,8 @@ extension EventInjector {
     // Handles swipe payloads like fingers=3, direction="left/right/up/down".
     func handleSwipe(fingers: Int, direction: String) throws {
         print("[EventInjector] handleSwipe fingers=\(fingers) direction=\(direction)")
-        // We currently only map three-finger swipes to Mission Control/Spaces actions.
-        guard fingers == 3 else { return }
+        // Map three- or four-finger swipes to Mission Control / Spaces / Exposé.
+        guard fingers == 3 || fingers == 4 else { return }
         switch direction.lowercased() {
         case "left":
             try controlArrowLeft()
@@ -232,6 +232,43 @@ extension EventInjector {
         }
         down.flags = controlFlag
         up.flags = controlFlag
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+    }
+
+    // MARK: - Command-key chords for navigation / zoom
+
+    /// Emulates a browser back/forward swipe via Cmd+[ (back) / Cmd+] (forward).
+    /// These are the standard macOS keyboard equivalents of the two-finger
+    /// navigation swipe and work across Safari, Finder, and most document apps.
+    func handleNav(direction: String) throws {
+        print("[EventInjector] handleNav direction=\(direction)")
+        switch direction.lowercased() {
+        case "back":
+            try pressCommandKey(33)   // [
+        case "forward":
+            try pressCommandKey(30)   // ]
+        default:
+            break
+        }
+    }
+
+    /// Emulates pinch-to-zoom via Cmd+= (zoom in) / Cmd+- (zoom out), the
+    /// standard keyboard equivalents honored by most zoom-capable apps.
+    func handlePinch(zoomIn: Bool) throws {
+        print("[EventInjector] handlePinch zoomIn=\(zoomIn)")
+        try pressCommandKey(zoomIn ? 24 : 27)  // = / -
+    }
+
+    private func pressCommandKey(_ keyCode: CGKeyCode) throws {
+        print("[EventInjector] pressCommandKey keyCode=\(keyCode)")
+        let commandFlag: CGEventFlags = .maskCommand
+        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true),
+              let up = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else {
+            throw InjectError.eventCreateFailed
+        }
+        down.flags = commandFlag
+        up.flags = commandFlag
         down.post(tap: .cghidEventTap)
         up.post(tap: .cghidEventTap)
     }

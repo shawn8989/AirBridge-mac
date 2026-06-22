@@ -412,6 +412,14 @@ final class NetworkManager {
                 if let payload = dict["payload"] as? [String: Any], let name = payload["name"] as? String {
                     try? self.eventInjector.handleAction(name: name)
                 }
+            case "nav":
+                if let payload = dict["payload"] as? [String: Any], let direction = payload["direction"] as? String {
+                    try? self.eventInjector.handleNav(direction: direction)
+                }
+            case "pinch":
+                if let payload = dict["payload"] as? [String: Any], let direction = payload["direction"] as? String {
+                    try? self.eventInjector.handlePinch(zoomIn: direction.lowercased() == "in")
+                }
             case "pair_request":
                 // (Re-)pairing initiated by the client (e.g. it has no key for this
                 // Mac). Require explicit user approval, then store the new secret
