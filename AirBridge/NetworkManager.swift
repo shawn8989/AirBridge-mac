@@ -132,6 +132,18 @@ final class NetworkManager {
         return Host.current().localizedName ?? "Mac"
     }
 
+    #if os(macOS)
+    // Launches an app by bundle identifier using the modern, non-deprecated
+    // NSWorkspace.openApplication API (replaces launchApplication(withBundleIdentifier:)).
+    private func launchApp(bundleID: String) {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+            print("[NetworkManager] launchApp: no app found for \(bundleID)")
+            return
+        }
+        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+    }
+    #endif
+
     // Stable per-Mac identifier so the iPhone can key its per-Mac secret.
     private func machineID() -> String {
         let key = "airbridge.machineID"
@@ -624,7 +636,7 @@ final class NetworkManager {
             case "launch_app":
                 #if os(macOS)
                 if let payload = dict["payload"] as? [String: Any], let bundleID = payload["bundleIdentifier"] as? String {
-                    NSWorkspace.shared.launchApplication(withBundleIdentifier: bundleID, options: [.default], additionalEventParamDescriptor: nil, launchIdentifier: nil)
+                    self.launchApp(bundleID: bundleID)
                 } else {
                     self.sendError("launch_app missing payload.bundleIdentifier", to: connection)
                 }
@@ -634,7 +646,7 @@ final class NetworkManager {
                 #if os(macOS)
                 if let payload = dict["payload"] as? [String: Any], let bundleID = payload["bundleIdentifier"] as? String {
                     if let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bundleID }) {
-                        _ = app.activate(options: [.activateIgnoringOtherApps])
+                        _ = app.activate()
                     } else {
                         self.sendError("activate_app: app not running: \(bundleID)", to: connection)
                     }
@@ -650,9 +662,9 @@ final class NetworkManager {
                         guard let self else { return }
                         let ws = NSWorkspace.shared
                         if let app = ws.runningApplications.first(where: { $0.bundleIdentifier == bundleID }) {
-                            _ = app.activate(options: [.activateIgnoringOtherApps])
+                            _ = app.activate()
                         } else {
-                            ws.launchApplication(withBundleIdentifier: bundleID, options: [.default], additionalEventParamDescriptor: nil, launchIdentifier: nil)
+                            self.launchApp(bundleID: bundleID)
                         }
                         // After action, send updated desktops and windows
                         self._sendDesktopsAndWindows(connection: connection)
@@ -1139,7 +1151,7 @@ private extension NetworkManager {
         guard let entry = windowInfo.first(where: { ($0[kCGWindowNumber as String] as? Int) == targetWindowNumber }) else { return }
         guard let ownerPID = entry[kCGWindowOwnerPID as String] as? Int32 else { return }
         let pid = pid_t(ownerPID)
-        if let app = NSRunningApplication(processIdentifier: pid) { _ = app.activate(options: [.activateIgnoringOtherApps]) }
+        if let app = NSRunningApplication(processIdentifier: pid) { _ = app.activate() }
         let appAX = AXUIElementCreateApplication(pid)
         var value: CFTypeRef?
         if AXUIElementCopyAttributeValue(appAX, kAXWindowsAttribute as CFString, &value) == .success, let arr = value as? [AXUIElement] {
