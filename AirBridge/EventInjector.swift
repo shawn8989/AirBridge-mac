@@ -53,7 +53,7 @@ final class EventInjector {
         let loc = CGEvent(source: nil)?.location ?? .zero
         let newPoint = CGPoint(x: loc.x + dx, y: loc.y + dy)
         // Ensure the mouse and cursor positions are associated (sometimes required for programmatic movement).
-        _ = CGAssociateMouseAndMouseCursorPosition(Int32(1))
+        _ = CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
 
         // Move the cursor immediately; some apps/contexts only honor warping.
         CGWarpMouseCursorPosition(newPoint)
