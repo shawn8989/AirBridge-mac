@@ -127,6 +127,20 @@ final class NetworkManager {
         _ = AXIsProcessTrustedWithOptions(opts)
     }
 
+    // Human-readable name for this Mac, shown on the iPhone when picking a Mac.
+    private func machineName() -> String {
+        return Host.current().localizedName ?? "Mac"
+    }
+
+    // Stable per-Mac identifier so the iPhone can key its per-Mac secret.
+    private func machineID() -> String {
+        let key = "airbridge.machineID"
+        if let existing = UserDefaults.standard.string(forKey: key) { return existing }
+        let newID = UUID().uuidString
+        UserDefaults.standard.set(newID, forKey: key)
+        return newID
+    }
+
     func start() async {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             queue.async { [weak self] in
@@ -237,6 +251,12 @@ final class NetworkManager {
             case "hello":
                 if let payload = dict["payload"] as? [String: Any], let deviceID = payload["deviceID"] as? String {
                     box.deviceID = deviceID
+                    // Tell the client which Mac this is so it can select/store the
+                    // matching per-device key (enables one iPhone <-> many Macs).
+                    self.sendLine(connection, jsonObject: [
+                        "type": "server_info",
+                        "payload": ["macID": self.machineID(), "macName": self.machineName()]
+                    ])
                     // Attempt to load existing secret
                     if let _ = try? self.security.loadSharedSecret(for: deviceID) {
                         // Known device: require proof it holds the shared secret
@@ -265,6 +285,12 @@ final class NetworkManager {
                                     // approval; the secret was exchanged over the
                                     // encrypted channel — authorize this connection.
                                     self.connectionBoxes[connKey]?.authenticated = true
+                                    // Send the secret so the client can store it
+                                    // under this Mac's ID.
+                                    self.sendLine(connection, jsonObject: [
+                                        "type": "pair_response",
+                                        "shared_secret": pendingSecret.base64EncodedString()
+                                    ])
                                     self.onDeviceConnected(pendingDeviceID)
                                 } else {
                                     self.sendError("Pairing denied for \(pendingDeviceID)", to: connection)
@@ -387,10 +413,31 @@ final class NetworkManager {
                     try? self.eventInjector.handleAction(name: name)
                 }
             case "pair_request":
-                // Respond with the pending secret (already generated on accept)
-                let secretB64 = box.pendingSecret.base64EncodedString()
-                let response: [String: Any] = ["type": "pair_response", "shared_secret": secretB64]
-                self.sendLine(connection, jsonObject: response)
+                // (Re-)pairing initiated by the client (e.g. it has no key for this
+                // Mac). Require explicit user approval, then store the new secret
+                // (replacing any stale one) and send it back so both sides match.
+                guard let deviceID = box.deviceID else {
+                    self.sendError("pair_request before hello", to: connection); break
+                }
+                let pendingDeviceID = deviceID
+                let pendingSecret = box.pendingSecret
+                let connKey = ObjectIdentifier(connection)
+                self.onUnknownDevice(pendingDeviceID, pendingSecret) { [weak self] allowed in
+                    guard let self else { return }
+                    self.queue.async {
+                        if allowed {
+                            self.connectionBoxes[connKey]?.authenticated = true
+                            self.sendLine(connection, jsonObject: [
+                                "type": "pair_response",
+                                "shared_secret": pendingSecret.base64EncodedString()
+                            ])
+                            self.onDeviceConnected(pendingDeviceID)
+                        } else {
+                            self.sendError("Pairing denied for \(pendingDeviceID)", to: connection)
+                            connection.cancel()
+                        }
+                    }
+                }
             case "video_start":
                 if let payload = dict["payload"] as? [String: Any] {
                     if let maxW = payload["maxWidth"] as? Int { self.videoMaxWidth = maxW }
