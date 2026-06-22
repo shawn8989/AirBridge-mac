@@ -164,7 +164,7 @@ final class NetworkManager {
         do {
             let listener = try NWListener(using: params, on: 0)
             self.listener = listener
-            listener.service = NWListener.Service(name: "AirBridge", type: "_airbridge._tcp")
+            listener.service = NWListener.Service(name: self.machineName(), type: "_airbridge._tcp")
             listener.stateUpdateHandler = { [weak self] state in
                 switch state {
                 case .ready:
