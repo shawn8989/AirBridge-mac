@@ -417,7 +417,21 @@ final class NetworkManager {
                     else if let fD = payload["fingers"] as? Double { fingers = Int(fD) }
                     let direction = (payload["direction"] as? String)?.lowercased()
                     if let fingers = fingers, let direction = direction {
+                        #if os(macOS)
+                        // Left/right swipes switch Spaces. Drive this directly via
+                        // SkyLight rather than synthetic Ctrl+Arrow: it doesn't
+                        // depend on the Mission Control keyboard shortcuts being
+                        // enabled and is far more reliable than posted key events.
+                        if direction == "left" || direction == "right" {
+                            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                                self?.switchSpace(offset: direction == "right" ? 1 : -1, fallbackFingers: fingers)
+                            }
+                        } else {
+                            try? self.eventInjector.handleSwipe(fingers: fingers, direction: direction)
+                        }
+                        #else
                         try? self.eventInjector.handleSwipe(fingers: fingers, direction: direction)
+                        #endif
                     }
                 }
             case "action":
@@ -1103,6 +1117,32 @@ private extension NetworkManager {
         else if let n = target["ManagedSpaceID"] as? Int { msid = n }
         else { throw AirBridgeError.spaceNotFound }
         setCurrent(conn, displayIdentifier as CFString, msid)
+    }
+
+    /// Switches to the Space `offset` positions away (e.g. +1 = the Space to the
+    /// right) using SkyLight directly, so it works regardless of the Mission
+    /// Control keyboard-shortcut settings. Falls back to a synthetic Ctrl+Arrow
+    /// only if the private API is unavailable.
+    func switchSpace(offset: Int, fallbackFingers: Int) {
+        do {
+            let desktops = try _enumerateDesktops()
+            guard !desktops.isEmpty else { throw AirBridgeError.spacesUnavailable }
+            guard let current = _currentDesktopIndex(from: desktops) else { throw AirBridgeError.spaceNotFound }
+            let targetIndex = current + offset
+            // No wrap-around: stay put at the edges, matching native behavior.
+            guard targetIndex >= 1, targetIndex <= desktops.count,
+                  let target = desktops.first(where: { ($0["index"] as? Int) == targetIndex }),
+                  let id = target["id"] as? String else {
+                print("[NetworkManager] switchSpace: no Space at index \(targetIndex) (have \(desktops.count))")
+                return
+            }
+            try _focusDesktop(id: id)
+            print("[NetworkManager] switchSpace -> index \(targetIndex)")
+        } catch {
+            // SkyLight unavailable; fall back to the keyboard shortcut.
+            print("[NetworkManager] switchSpace falling back to Ctrl+Arrow: \(error)")
+            try? eventInjector.handleSwipe(fingers: fallbackFingers, direction: offset > 0 ? "right" : "left")
+        }
     }
 
     func _enumerateOpenWindows() throws -> [[String: Any]] {
