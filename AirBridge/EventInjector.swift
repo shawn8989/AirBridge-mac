@@ -7,6 +7,9 @@
 
 import Foundation
 import CoreGraphics
+#if os(macOS)
+import AppKit
+#endif
 
 enum MouseClickKind: String, Codable {
     case left, right, middle
@@ -273,3 +276,58 @@ extension EventInjector {
         up.post(tap: .cghidEventTap)
     }
 }
+
+#if os(macOS)
+extension EventInjector {
+    /// Media and system controls. Volume/brightness/playback are NOT normal
+    /// key codes — they are NX_KEYTYPE_* "system-defined" events, which is why
+    /// they go through NSEvent.otherEvent rather than CGEvent keyboard events.
+    func handleMedia(action: String) throws {
+        print("[EventInjector] handleMedia action=\(action)")
+        switch action {
+        case "volume_up":       postSystemKey(0)   // NX_KEYTYPE_SOUND_UP
+        case "volume_down":     postSystemKey(1)   // NX_KEYTYPE_SOUND_DOWN
+        case "mute":            postSystemKey(7)   // NX_KEYTYPE_MUTE
+        case "play_pause":      postSystemKey(16)  // NX_KEYTYPE_PLAY
+        case "next":            postSystemKey(17)  // NX_KEYTYPE_NEXT
+        case "previous":        postSystemKey(18)  // NX_KEYTYPE_PREVIOUS
+        case "brightness_up":   postSystemKey(2)   // NX_KEYTYPE_BRIGHTNESS_UP
+        case "brightness_down": postSystemKey(3)   // NX_KEYTYPE_BRIGHTNESS_DOWN
+        case "lock_screen":     try lockScreen()
+        default: break
+        }
+    }
+
+    private func postSystemKey(_ key: Int32) {
+        func post(down: Bool) {
+            let data1 = Int((Int32(key) << 16) | Int32(down ? 0x0A00 : 0x0B00))
+            guard let ev = NSEvent.otherEvent(with: .systemDefined,
+                                              location: .zero,
+                                              modifierFlags: NSEvent.ModifierFlags(rawValue: down ? 0xA00 : 0xB00),
+                                              timestamp: ProcessInfo.processInfo.systemUptime,
+                                              windowNumber: 0,
+                                              context: nil,
+                                              subtype: 8,
+                                              data1: data1,
+                                              data2: -1) else { return }
+            ev.cgEvent?.post(tap: .cghidEventTap)
+        }
+        post(down: true)
+        post(down: false)
+    }
+
+    /// Locks the screen via the system shortcut Ctrl+Cmd+Q.
+    private func lockScreen() throws {
+        let qKey: CGKeyCode = 12
+        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: qKey, keyDown: true),
+              let up = CGEvent(keyboardEventSource: nil, virtualKey: qKey, keyDown: false) else {
+            throw InjectError.eventCreateFailed
+        }
+        let flags: CGEventFlags = [.maskCommand, .maskControl]
+        down.flags = flags
+        up.flags = flags
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+    }
+}
+#endif
