@@ -127,6 +127,32 @@ final class NetworkManager {
         _ = AXIsProcessTrustedWithOptions(opts)
     }
 
+    // Human-readable name for this Mac, shown on the iPhone when picking a Mac.
+    private func machineName() -> String {
+        return Host.current().localizedName ?? "Mac"
+    }
+
+    #if os(macOS)
+    // Launches an app by bundle identifier using the modern, non-deprecated
+    // NSWorkspace.openApplication API (replaces launchApplication(withBundleIdentifier:)).
+    private func launchApp(bundleID: String) {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+            print("[NetworkManager] launchApp: no app found for \(bundleID)")
+            return
+        }
+        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+    }
+    #endif
+
+    // Stable per-Mac identifier so the iPhone can key its per-Mac secret.
+    private func machineID() -> String {
+        let key = "airbridge.machineID"
+        if let existing = UserDefaults.standard.string(forKey: key) { return existing }
+        let newID = UUID().uuidString
+        UserDefaults.standard.set(newID, forKey: key)
+        return newID
+    }
+
     func start() async {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             queue.async { [weak self] in
@@ -150,7 +176,7 @@ final class NetworkManager {
         do {
             let listener = try NWListener(using: params, on: 0)
             self.listener = listener
-            listener.service = NWListener.Service(name: "AirBridge", type: "_airbridge._tcp")
+            listener.service = NWListener.Service(name: self.machineName(), type: "_airbridge._tcp")
             listener.stateUpdateHandler = { [weak self] state in
                 switch state {
                 case .ready:
@@ -237,6 +263,12 @@ final class NetworkManager {
             case "hello":
                 if let payload = dict["payload"] as? [String: Any], let deviceID = payload["deviceID"] as? String {
                     box.deviceID = deviceID
+                    // Tell the client which Mac this is so it can select/store the
+                    // matching per-device key (enables one iPhone <-> many Macs).
+                    self.sendLine(connection, jsonObject: [
+                        "type": "server_info",
+                        "payload": ["macID": self.machineID(), "macName": self.machineName()]
+                    ])
                     // Attempt to load existing secret
                     if let _ = try? self.security.loadSharedSecret(for: deviceID) {
                         // Known device: require proof it holds the shared secret
@@ -265,6 +297,12 @@ final class NetworkManager {
                                     // approval; the secret was exchanged over the
                                     // encrypted channel — authorize this connection.
                                     self.connectionBoxes[connKey]?.authenticated = true
+                                    // Send the secret so the client can store it
+                                    // under this Mac's ID.
+                                    self.sendLine(connection, jsonObject: [
+                                        "type": "pair_response",
+                                        "shared_secret": pendingSecret.base64EncodedString()
+                                    ])
                                     self.onDeviceConnected(pendingDeviceID)
                                 } else {
                                     self.sendError("Pairing denied for \(pendingDeviceID)", to: connection)
@@ -379,18 +417,69 @@ final class NetworkManager {
                     else if let fD = payload["fingers"] as? Double { fingers = Int(fD) }
                     let direction = (payload["direction"] as? String)?.lowercased()
                     if let fingers = fingers, let direction = direction {
+                        #if os(macOS)
+                        switch direction {
+                        // Left/right swipes switch Spaces. Drive this directly via
+                        // SkyLight rather than synthetic Ctrl+Arrow: it doesn't
+                        // depend on the Mission Control keyboard shortcuts being
+                        // enabled and is far more reliable than posted key events.
+                        case "left", "right":
+                            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                                self?.switchSpace(offset: direction == "right" ? 1 : -1, fallbackFingers: fingers)
+                            }
+                        // Up/down open Mission Control / App Exposé by launching
+                        // Mission Control.app directly — synthetic Ctrl+Arrow is
+                        // ignored by WindowServer on some macOS versions.
+                        case "up":
+                            self.triggerMissionControl(appExpose: false, fallbackFingers: fingers)
+                        case "down":
+                            self.triggerMissionControl(appExpose: true, fallbackFingers: fingers)
+                        default:
+                            try? self.eventInjector.handleSwipe(fingers: fingers, direction: direction)
+                        }
+                        #else
                         try? self.eventInjector.handleSwipe(fingers: fingers, direction: direction)
+                        #endif
                     }
                 }
             case "action":
                 if let payload = dict["payload"] as? [String: Any], let name = payload["name"] as? String {
                     try? self.eventInjector.handleAction(name: name)
                 }
+            case "nav":
+                if let payload = dict["payload"] as? [String: Any], let direction = payload["direction"] as? String {
+                    try? self.eventInjector.handleNav(direction: direction)
+                }
+            case "pinch":
+                if let payload = dict["payload"] as? [String: Any], let direction = payload["direction"] as? String {
+                    try? self.eventInjector.handlePinch(zoomIn: direction.lowercased() == "in")
+                }
             case "pair_request":
-                // Respond with the pending secret (already generated on accept)
-                let secretB64 = box.pendingSecret.base64EncodedString()
-                let response: [String: Any] = ["type": "pair_response", "shared_secret": secretB64]
-                self.sendLine(connection, jsonObject: response)
+                // (Re-)pairing initiated by the client (e.g. it has no key for this
+                // Mac). Require explicit user approval, then store the new secret
+                // (replacing any stale one) and send it back so both sides match.
+                guard let deviceID = box.deviceID else {
+                    self.sendError("pair_request before hello", to: connection); break
+                }
+                let pendingDeviceID = deviceID
+                let pendingSecret = box.pendingSecret
+                let connKey = ObjectIdentifier(connection)
+                self.onUnknownDevice(pendingDeviceID, pendingSecret) { [weak self] allowed in
+                    guard let self else { return }
+                    self.queue.async {
+                        if allowed {
+                            self.connectionBoxes[connKey]?.authenticated = true
+                            self.sendLine(connection, jsonObject: [
+                                "type": "pair_response",
+                                "shared_secret": pendingSecret.base64EncodedString()
+                            ])
+                            self.onDeviceConnected(pendingDeviceID)
+                        } else {
+                            self.sendError("Pairing denied for \(pendingDeviceID)", to: connection)
+                            connection.cancel()
+                        }
+                    }
+                }
             case "video_start":
                 if let payload = dict["payload"] as? [String: Any] {
                     if let maxW = payload["maxWidth"] as? Int { self.videoMaxWidth = maxW }
@@ -569,7 +658,7 @@ final class NetworkManager {
             case "launch_app":
                 #if os(macOS)
                 if let payload = dict["payload"] as? [String: Any], let bundleID = payload["bundleIdentifier"] as? String {
-                    NSWorkspace.shared.launchApplication(withBundleIdentifier: bundleID, options: [.default], additionalEventParamDescriptor: nil, launchIdentifier: nil)
+                    self.launchApp(bundleID: bundleID)
                 } else {
                     self.sendError("launch_app missing payload.bundleIdentifier", to: connection)
                 }
@@ -579,7 +668,7 @@ final class NetworkManager {
                 #if os(macOS)
                 if let payload = dict["payload"] as? [String: Any], let bundleID = payload["bundleIdentifier"] as? String {
                     if let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bundleID }) {
-                        _ = app.activate(options: [.activateIgnoringOtherApps])
+                        _ = app.activate()
                     } else {
                         self.sendError("activate_app: app not running: \(bundleID)", to: connection)
                     }
@@ -595,9 +684,9 @@ final class NetworkManager {
                         guard let self else { return }
                         let ws = NSWorkspace.shared
                         if let app = ws.runningApplications.first(where: { $0.bundleIdentifier == bundleID }) {
-                            _ = app.activate(options: [.activateIgnoringOtherApps])
+                            _ = app.activate()
                         } else {
-                            ws.launchApplication(withBundleIdentifier: bundleID, options: [.default], additionalEventParamDescriptor: nil, launchIdentifier: nil)
+                            self.launchApp(bundleID: bundleID)
                         }
                         // After action, send updated desktops and windows
                         self._sendDesktopsAndWindows(connection: connection)
@@ -1038,6 +1127,56 @@ private extension NetworkManager {
         setCurrent(conn, displayIdentifier as CFString, msid)
     }
 
+    /// Switches to the Space `offset` positions away (e.g. +1 = the Space to the
+    /// right) using SkyLight directly, so it works regardless of the Mission
+    /// Control keyboard-shortcut settings. Falls back to a synthetic Ctrl+Arrow
+    /// only if the private API is unavailable.
+    func switchSpace(offset: Int, fallbackFingers: Int) {
+        do {
+            let desktops = try _enumerateDesktops()
+            guard !desktops.isEmpty else { throw AirBridgeError.spacesUnavailable }
+            guard let current = _currentDesktopIndex(from: desktops) else { throw AirBridgeError.spaceNotFound }
+            let targetIndex = current + offset
+            // No wrap-around: stay put at the edges, matching native behavior.
+            guard targetIndex >= 1, targetIndex <= desktops.count,
+                  let target = desktops.first(where: { ($0["index"] as? Int) == targetIndex }),
+                  let id = target["id"] as? String else {
+                print("[NetworkManager] switchSpace: no Space at index \(targetIndex) (have \(desktops.count))")
+                return
+            }
+            try _focusDesktop(id: id)
+            print("[NetworkManager] switchSpace -> index \(targetIndex)")
+        } catch {
+            // SkyLight unavailable; fall back to the keyboard shortcut.
+            print("[NetworkManager] switchSpace falling back to Ctrl+Arrow: \(error)")
+            try? eventInjector.handleSwipe(fingers: fallbackFingers, direction: offset > 0 ? "right" : "left")
+        }
+    }
+
+    /// Opens Mission Control (all windows) or App Exposé (front app's windows)
+    /// by invoking Mission Control.app itself. Launching the app toggles the
+    /// overview reliably; its binary accepts "2" to show App Exposé instead.
+    /// Falls back to the synthetic Ctrl+Arrow shortcut if the app is missing.
+    func triggerMissionControl(appExpose: Bool, fallbackFingers: Int) {
+        let appURL = URL(fileURLWithPath: "/System/Applications/Mission Control.app")
+        let binURL = appURL.appendingPathComponent("Contents/MacOS/Mission Control")
+        guard FileManager.default.fileExists(atPath: binURL.path) else {
+            print("[NetworkManager] Mission Control.app not found; falling back to Ctrl+Arrow")
+            try? eventInjector.handleSwipe(fingers: fallbackFingers, direction: appExpose ? "down" : "up")
+            return
+        }
+        let proc = Process()
+        proc.executableURL = binURL
+        if appExpose { proc.arguments = ["2"] }
+        do {
+            try proc.run()
+            print("[NetworkManager] triggerMissionControl appExpose=\(appExpose)")
+        } catch {
+            print("[NetworkManager] Mission Control launch failed (\(error)); falling back to Ctrl+Arrow")
+            try? eventInjector.handleSwipe(fingers: fallbackFingers, direction: appExpose ? "down" : "up")
+        }
+    }
+
     func _enumerateOpenWindows() throws -> [[String: Any]] {
         guard let windowInfo = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else { return [] }
         let spaceMap = _buildWindowToSpaceIndexMap()
@@ -1084,7 +1223,7 @@ private extension NetworkManager {
         guard let entry = windowInfo.first(where: { ($0[kCGWindowNumber as String] as? Int) == targetWindowNumber }) else { return }
         guard let ownerPID = entry[kCGWindowOwnerPID as String] as? Int32 else { return }
         let pid = pid_t(ownerPID)
-        if let app = NSRunningApplication(processIdentifier: pid) { _ = app.activate(options: [.activateIgnoringOtherApps]) }
+        if let app = NSRunningApplication(processIdentifier: pid) { _ = app.activate() }
         let appAX = AXUIElementCreateApplication(pid)
         var value: CFTypeRef?
         if AXUIElementCopyAttributeValue(appAX, kAXWindowsAttribute as CFString, &value) == .success, let arr = value as? [AXUIElement] {
