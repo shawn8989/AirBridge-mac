@@ -418,15 +418,23 @@ final class NetworkManager {
                     let direction = (payload["direction"] as? String)?.lowercased()
                     if let fingers = fingers, let direction = direction {
                         #if os(macOS)
+                        switch direction {
                         // Left/right swipes switch Spaces. Drive this directly via
                         // SkyLight rather than synthetic Ctrl+Arrow: it doesn't
                         // depend on the Mission Control keyboard shortcuts being
                         // enabled and is far more reliable than posted key events.
-                        if direction == "left" || direction == "right" {
+                        case "left", "right":
                             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                                 self?.switchSpace(offset: direction == "right" ? 1 : -1, fallbackFingers: fingers)
                             }
-                        } else {
+                        // Up/down open Mission Control / App Exposé by launching
+                        // Mission Control.app directly — synthetic Ctrl+Arrow is
+                        // ignored by WindowServer on some macOS versions.
+                        case "up":
+                            self.triggerMissionControl(appExpose: false, fallbackFingers: fingers)
+                        case "down":
+                            self.triggerMissionControl(appExpose: true, fallbackFingers: fingers)
+                        default:
                             try? self.eventInjector.handleSwipe(fingers: fingers, direction: direction)
                         }
                         #else
@@ -1142,6 +1150,30 @@ private extension NetworkManager {
             // SkyLight unavailable; fall back to the keyboard shortcut.
             print("[NetworkManager] switchSpace falling back to Ctrl+Arrow: \(error)")
             try? eventInjector.handleSwipe(fingers: fallbackFingers, direction: offset > 0 ? "right" : "left")
+        }
+    }
+
+    /// Opens Mission Control (all windows) or App Exposé (front app's windows)
+    /// by invoking Mission Control.app itself. Launching the app toggles the
+    /// overview reliably; its binary accepts "2" to show App Exposé instead.
+    /// Falls back to the synthetic Ctrl+Arrow shortcut if the app is missing.
+    func triggerMissionControl(appExpose: Bool, fallbackFingers: Int) {
+        let appURL = URL(fileURLWithPath: "/System/Applications/Mission Control.app")
+        let binURL = appURL.appendingPathComponent("Contents/MacOS/Mission Control")
+        guard FileManager.default.fileExists(atPath: binURL.path) else {
+            print("[NetworkManager] Mission Control.app not found; falling back to Ctrl+Arrow")
+            try? eventInjector.handleSwipe(fingers: fallbackFingers, direction: appExpose ? "down" : "up")
+            return
+        }
+        let proc = Process()
+        proc.executableURL = binURL
+        if appExpose { proc.arguments = ["2"] }
+        do {
+            try proc.run()
+            print("[NetworkManager] triggerMissionControl appExpose=\(appExpose)")
+        } catch {
+            print("[NetworkManager] Mission Control launch failed (\(error)); falling back to Ctrl+Arrow")
+            try? eventInjector.handleSwipe(fingers: fallbackFingers, direction: appExpose ? "down" : "up")
         }
     }
 
