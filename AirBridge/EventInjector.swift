@@ -316,6 +316,31 @@ extension EventInjector {
         post(down: false)
     }
 
+    /// Types an arbitrary string by attaching unicode payloads to key events —
+    /// works for any text without needing per-character key-code mapping.
+    /// CGEvent accepts a limited unicode run per event, so long strings are
+    /// sent in small chunks.
+    func typeText(_ text: String) throws {
+        print("[EventInjector] typeText length=\(text.count)")
+        let units = Array(text.utf16)
+        let chunkSize = 16
+        var i = 0
+        while i < units.count {
+            let chunk = Array(units[i..<min(i + chunkSize, units.count)])
+            guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+                throw InjectError.eventCreateFailed
+            }
+            down.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+            up.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+            i += chunkSize
+            // Tiny pause keeps fast consumers (terminals, web inputs) from dropping chunks.
+            usleep(4000)
+        }
+    }
+
     /// Locks the screen via the system shortcut Ctrl+Cmd+Q.
     private func lockScreen() throws {
         let qKey: CGKeyCode = 12

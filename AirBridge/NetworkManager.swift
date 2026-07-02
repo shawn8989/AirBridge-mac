@@ -460,6 +460,32 @@ final class NetworkManager {
                     try? self.eventInjector.handleMedia(action: action)
                 }
                 #endif
+            case "type_text":
+                // Types a whole string on the Mac (dictation, clipboard paste-through).
+                if let payload = dict["payload"] as? [String: Any], let text = payload["text"] as? String {
+                    try? self.eventInjector.typeText(text)
+                }
+            case "clipboard_set":
+                #if os(macOS)
+                if let payload = dict["payload"] as? [String: Any], let text = payload["text"] as? String {
+                    DispatchQueue.main.async {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(text, forType: .string)
+                    }
+                }
+                #endif
+            case "clipboard_get":
+                #if os(macOS)
+                DispatchQueue.main.async { [weak self] in
+                    let text = NSPasteboard.general.string(forType: .string) ?? ""
+                    self?.queue.async {
+                        self?.sendLine(connection, jsonObject: [
+                            "type": "clipboard_data",
+                            "payload": ["text": text]
+                        ])
+                    }
+                }
+                #endif
             case "pair_request":
                 // (Re-)pairing initiated by the client (e.g. it has no key for this
                 // Mac). Require explicit user approval, then store the new secret
