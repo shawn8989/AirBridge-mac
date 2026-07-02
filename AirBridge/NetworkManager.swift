@@ -242,13 +242,18 @@ final class NetworkManager {
         }
     }
 
+    // High-rate input types arrive up to ~120/s; logging each one adds real
+    // latency to the event path, so they are excluded from RX logging.
+    private static let quietTypes: Set<String> = ["mouse_move", "scroll"]
+
     private func handleLine(_ lineData: Data, from connection: NWConnection, box: ConnectionBox) {
-        guard let raw = String(data: lineData, encoding: .utf8) else { return }
-        print("[AirBridge] RX line: \(raw)")
         do {
             let obj = try JSONSerialization.jsonObject(with: lineData, options: [])
             guard let dict = obj as? [String: Any], let type = dict["type"] as? String else {
                 throw NSError(domain: "AirBridge", code: -1, userInfo: [NSLocalizedDescriptionKey: "Missing type field"])
+            }
+            if !Self.quietTypes.contains(type), let raw = String(data: lineData, encoding: .utf8) {
+                print("[AirBridge] RX line: \(raw)")
             }
             // Gate all functional messages until the connection has proven
             // knowledge of the device's per-device shared secret via the
@@ -968,6 +973,7 @@ final class NetworkManager {
                 break
             }
         } catch {
+            let raw = String(data: lineData, encoding: .utf8) ?? "<non-utf8>"
             print("[AirBridge] Parse error: \(error.localizedDescription) line=\(raw)")
             sendError("parse_error: \(error.localizedDescription)", to: connection)
         }

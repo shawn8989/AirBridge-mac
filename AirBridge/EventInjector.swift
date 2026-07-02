@@ -73,7 +73,7 @@ final class EventInjector {
         else { eventType = .mouseMoved; button = .left }
 
         guard let move = CGEvent(mouseEventSource: source, mouseType: eventType, mouseCursorPosition: newPoint, mouseButton: button) else { throw InjectError.eventCreateFailed }
-        print("[EventInjector] moveMouse dx=\(dx) dy=\(dy) -> \(newPoint) type=\(eventType)")
+        // No logging here: this runs up to ~120x/s and printing adds latency.
         move.post(tap: .cghidEventTap)
     }
 
@@ -98,7 +98,7 @@ final class EventInjector {
     }
 
     func scroll(dx: Double, dy: Double) throws {
-        print("[EventInjector] scroll dx=\(dx) dy=\(dy)")
+        // No logging here: high-rate path, printing adds latency.
         // Use pixel-based scrolling for smooth trackpad-like behavior.
         let pixelsY = Int32(dy)
         let pixelsX = Int32(dx)
