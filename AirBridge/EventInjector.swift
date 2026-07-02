@@ -51,12 +51,21 @@ struct AirPacketRaw: Codable {
 final class EventInjector {
     enum InjectError: Error { case eventCreateFailed }
 
+    // Reused across events: allocating a CGEventSource per move (up to 120/s)
+    // is measurable overhead on the injection path.
+    private let moveSource = CGEventSource(stateID: .hidSystemState)
+    private var didAssociateCursor = false
+
     func moveMouse(dx: Double, dy: Double) throws {
-        let source = CGEventSource(stateID: .hidSystemState)
+        let source = moveSource
         let loc = CGEvent(source: nil)?.location ?? .zero
         let newPoint = CGPoint(x: loc.x + dx, y: loc.y + dy)
-        // Ensure the mouse and cursor positions are associated (sometimes required for programmatic movement).
-        _ = CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+        // Ensure the mouse and cursor positions are associated (sometimes
+        // required for programmatic movement). Once is enough.
+        if !didAssociateCursor {
+            _ = CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+            didAssociateCursor = true
+        }
 
         // Move the cursor immediately; some apps/contexts only honor warping.
         CGWarpMouseCursorPosition(newPoint)
