@@ -235,6 +235,10 @@ final class NetworkManager {
                 let deviceID = box.deviceID
                 self.connectionBoxes.removeValue(forKey: key)
                 self.onDeviceDisconnected(deviceID)
+                // Safety: a dropped connection must not leave synthetic modifier
+                // keys latched (a stuck Ctrl turns every left click into a right
+                // click system-wide).
+                self.eventInjector.releaseAllModifiers()
                 connection.cancel()
                 return
             }

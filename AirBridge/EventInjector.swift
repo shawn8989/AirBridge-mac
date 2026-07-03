@@ -102,6 +102,14 @@ final class EventInjector {
         }
         guard let down = CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: pos, mouseButton: button),
               let up = CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: pos, mouseButton: button) else { throw InjectError.eventCreateFailed }
+        // Clear modifier flags explicitly: a latched synthetic Ctrl (from the
+        // keyboard's modifier toggles or an interrupted chord) otherwise rides
+        // along and macOS treats Ctrl+LeftClick as a RIGHT click (context menu).
+        down.flags = []
+        up.flags = []
+        // Proper single-click semantics; some apps ignore clicks without it.
+        down.setIntegerValueField(.mouseEventClickState, value: 1)
+        up.setIntegerValueField(.mouseEventClickState, value: 1)
         down.post(tap: .cghidEventTap)
         up.post(tap: .cghidEventTap)
     }
@@ -126,6 +134,20 @@ final class EventInjector {
         guard let ev = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else { throw InjectError.eventCreateFailed }
         ev.post(tap: .cghidEventTap)
     }
+
+    /// Releases every modifier key. Called when a client disconnects so a
+    /// dropped connection can never leave Cmd/Ctrl/Opt/Shift/Fn latched down
+    /// (a stuck Ctrl makes every left click behave as a right click).
+    func releaseAllModifiers() {
+        print("[EventInjector] releaseAllModifiers")
+        let modifierKeyCodes: [CGKeyCode] = [55, 58, 59, 56, 63] // Cmd, Opt, Ctrl, Shift, Fn
+        for code in modifierKeyCodes {
+            if let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) {
+                up.flags = []
+                up.post(tap: .cghidEventTap)
+            }
+        }
+    }
 }
 
 extension EventInjector {
@@ -146,6 +168,8 @@ extension EventInjector {
         guard let down = CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: pos, mouseButton: button) else {
             throw InjectError.eventCreateFailed
         }
+        down.flags = []  // never let a latched modifier turn this into Ctrl+click
+        down.setIntegerValueField(.mouseEventClickState, value: 1)
         down.post(tap: .cghidEventTap)
     }
 
@@ -166,6 +190,8 @@ extension EventInjector {
         guard let up = CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: pos, mouseButton: button) else {
             throw InjectError.eventCreateFailed
         }
+        up.flags = []  // never let a latched modifier turn this into Ctrl+click
+        up.setIntegerValueField(.mouseEventClickState, value: 1)
         up.post(tap: .cghidEventTap)
     }
 }
