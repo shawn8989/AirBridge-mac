@@ -463,6 +463,10 @@ final class NetworkManager {
                 if let payload = dict["payload"] as? [String: Any], let direction = payload["direction"] as? String {
                     try? self.eventInjector.handlePinch(zoomIn: direction.lowercased() == "in")
                 }
+            case "ping":
+                // Heartbeat: lets the client detect a half-dead connection
+                // (Mac asleep, Wi-Fi drop) instead of hanging silently.
+                self.sendLine(connection, jsonObject: ["type": "pong", "payload": [:]])
             case "media":
                 #if os(macOS)
                 if let payload = dict["payload"] as? [String: Any], let action = payload["action"] as? String {
