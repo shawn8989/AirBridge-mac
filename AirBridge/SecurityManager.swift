@@ -71,6 +71,19 @@ final class SecurityManager {
         return Data(mac)
     }
 
+    /// Derives the per-device shared secret from a scanned QR pairing secret.
+    /// MUST match AirPad's derivation exactly (HKDF-SHA256, salt = deviceID,
+    /// info = "AirPad-QR-Pair", 32 bytes).
+    func deriveQRPairSecret(qrSecret: Data, deviceID: String) -> Data {
+        let key = HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: qrSecret),
+                                         salt: Data(deviceID.utf8),
+                                         info: Data("AirPad-QR-Pair".utf8),
+                                         outputByteCount: 32)
+        var out = Data()
+        key.withUnsafeBytes { out.append(contentsOf: $0) }
+        return out
+    }
+
     /// Generate a random nonce (default 16 bytes)
     func generateNonce(length: Int = 16) -> Data {
         var bytes = [UInt8](repeating: 0, count: max(1, length))

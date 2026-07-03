@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import CoreImage
 
 struct ContentView: View {
     @EnvironmentObject private var appState: AppState
@@ -26,6 +27,14 @@ struct ContentView: View {
         .sheet(item: $appState.pendingPairRequest) { request in
             PairingPromptView(request: request) { allowed in
                 Task { await appState.handlePairingDecision(allowed: allowed, request: request) }
+            }
+        }
+        .sheet(isPresented: Binding(
+            get: { appState.qrPayload != nil },
+            set: { if !$0 { appState.hidePairingQR() } }
+        )) {
+            QRPairingView(payload: appState.qrPayload ?? "") {
+                appState.hidePairingQR()
             }
         }
     }
@@ -151,6 +160,13 @@ struct ContentView: View {
             }
             .toggleStyle(.switch)
 
+            Button {
+                appState.showPairingQR()
+            } label: {
+                Label("Show Pairing QR…", systemImage: "qrcode")
+            }
+            .help("Pair a new iPhone instantly by scanning — no approval dialog needed.")
+
             Divider()
 
             HStack(spacing: 8) {
@@ -219,6 +235,51 @@ struct PairingPromptView: View {
         }
         .padding(24)
         .frame(minWidth: 340)
+    }
+}
+
+/// Displays a one-time pairing QR code for AirPad to scan.
+struct QRPairingView: View {
+    let payload: String
+    let onClose: () -> Void
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Text("Pair a new iPhone")
+                .font(.headline)
+            if let image = Self.qrImage(from: payload) {
+                Image(nsImage: image)
+                    .interpolation(.none)   // crisp QR modules
+                    .resizable()
+                    .frame(width: 220, height: 220)
+                    .padding(10)
+                    .background(Color.white, in: RoundedRectangle(cornerRadius: 12))
+            } else {
+                Text("Could not generate QR code.")
+                    .foregroundStyle(.secondary)
+            }
+            Text("In AirPad, tap “Scan QR” and point the camera here.\nThe code works once and expires in 2 minutes.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button("Done") { onClose() }
+                .keyboardShortcut(.defaultAction)
+        }
+        .padding(24)
+        .frame(minWidth: 300)
+    }
+
+    private static func qrImage(from string: String) -> NSImage? {
+        guard let data = string.data(using: .utf8),
+              let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
+        filter.setValue(data, forKey: "inputMessage")
+        filter.setValue("M", forKey: "inputCorrectionLevel")
+        guard let output = filter.outputImage else { return nil }
+        let scaled = output.transformed(by: CGAffineTransform(scaleX: 10, y: 10))
+        let rep = NSCIImageRep(ciImage: scaled)
+        let image = NSImage(size: rep.size)
+        image.addRepresentation(rep)
+        return image
     }
 }
 

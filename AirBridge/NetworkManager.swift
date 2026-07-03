@@ -263,6 +263,34 @@ final class NetworkManager {
         queue.async { [weak self] in self?.inputPaused = paused }
     }
 
+    // MARK: - QR pairing
+    // One active QR secret at a time; valid 2 minutes or until first use.
+    private var activeQRSecret: (secret: Data, expires: Date)?
+    /// Called (on main) when a device pairs via QR so the UI can close the code.
+    var onQRPaired: ((String) -> Void)?
+
+    /// Generates a fresh QR pairing secret and returns the JSON string to
+    /// encode in the QR code. Called from the UI (any thread).
+    func beginQRPairing() -> String {
+        let secret = security.generateNonce(length: 32)
+        queue.async { [weak self] in
+            self?.activeQRSecret = (secret, Date().addingTimeInterval(120))
+        }
+        let payload: [String: Any] = [
+            "v": 1,
+            "macID": machineID(),
+            "macName": machineName(),
+            "qrSecret": secret.base64EncodedString()
+        ]
+        let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    /// Invalidates any outstanding QR secret (window closed / expired).
+    func cancelQRPairing() {
+        queue.async { [weak self] in self?.activeQRSecret = nil }
+    }
+
     private func handleLine(_ lineData: Data, from connection: NWConnection, box: ConnectionBox) {
         do {
             let obj = try JSONSerialization.jsonObject(with: lineData, options: [])
@@ -297,6 +325,28 @@ final class NetworkManager {
                         "type": "server_info",
                         "payload": ["macID": self.machineID(), "macName": self.machineName()]
                     ])
+                    // QR pairing: if the hello carries a proof of the currently
+                    // displayed QR secret, pair without any approval dialog —
+                    // scanning the code on the Mac's own screen IS the approval.
+                    if let proofB64 = payload["qrProof"] as? String,
+                       let proof = Data(base64Encoded: proofB64),
+                       let qr = self.activeQRSecret, Date() < qr.expires {
+                        let expected = self.security.computeHMAC(secret: qr.secret, data: Data(deviceID.utf8))
+                        if expected == proof {
+                            let derived = self.security.deriveQRPairSecret(qrSecret: qr.secret, deviceID: deviceID)
+                            try? self.security.storeSharedSecret(derived, for: deviceID)
+                            self.activeQRSecret = nil  // one-time use
+                            box.authenticated = true
+                            self.sendLine(connection, jsonObject: ["type": "pair_qr_ok", "payload": [:]])
+                            self.onDeviceConnected(deviceID)
+                            let handler = self.onQRPaired
+                            DispatchQueue.main.async { handler?(deviceID) }
+                            print("[AirBridge] QR-paired device \(deviceID)")
+                            break
+                        } else {
+                            print("[AirBridge] QR proof mismatch from \(deviceID)")
+                        }
+                    }
                     // Attempt to load existing secret
                     if let _ = try? self.security.loadSharedSecret(for: deviceID) {
                         // Known device: require proof it holds the shared secret

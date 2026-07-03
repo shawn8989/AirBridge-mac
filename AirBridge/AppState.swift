@@ -72,7 +72,30 @@ final class AppState: ObservableObject {
                 }
             }
         )
+        networkManager.onQRPaired = { [weak self] deviceID in
+            // Already hopped to main by NetworkManager.
+            self?.qrPayload = nil
+            self?.statusMessage = "Paired via QR: \(deviceID.prefix(8))…"
+        }
         Task { await networkManager.start() }
+    }
+
+    // MARK: - QR pairing UI state
+
+    /// JSON string currently displayed as a QR code (nil = window closed).
+    @Published var qrPayload: String?
+
+    func showPairingQR() {
+        qrPayload = networkManager.beginQRPairing()
+        // Auto-expire the display alongside the server-side 2-minute window.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 120) { [weak self] in
+            if self?.qrPayload != nil { self?.hidePairingQR() }
+        }
+    }
+
+    func hidePairingQR() {
+        qrPayload = nil
+        networkManager.cancelQRPairing()
     }
 
     func handle(packet: AirPacket) async {

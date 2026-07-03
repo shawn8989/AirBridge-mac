@@ -50,6 +50,12 @@ struct MenuBarContent: View {
 
             Divider()
 
+            Button("Show Pairing QR…") {
+                NSApp.activate(ignoringOtherApps: true)
+                NSApp.windows.first(where: { $0.canBecomeMain })?.makeKeyAndOrderFront(nil)
+                appState.showPairingQR()
+            }
+
             Button("Open AirBridge") {
                 NSApp.activate(ignoringOtherApps: true)
                 NSApp.windows.first(where: { $0.canBecomeMain })?.makeKeyAndOrderFront(nil)
