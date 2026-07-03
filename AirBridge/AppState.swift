@@ -8,6 +8,8 @@
 import Foundation
 import SwiftUI
 import Combine
+import ServiceManagement
+import ApplicationServices
 
 /// Represents a first-time pairing request from an unknown device.
 struct PairRequest: Identifiable {
@@ -98,6 +100,49 @@ final class AppState: ObservableObject {
             }
         } catch {
             statusMessage = "Event error: \(error.localizedDescription)"
+        }
+    }
+
+    // MARK: - Controls (dashboard + menu bar)
+
+    /// Suppresses input injection while leaving the connection healthy.
+    @Published var inputPaused = false {
+        didSet { networkManager.setInputPaused(inputPaused) }
+    }
+
+    var macName: String { Host.current().localizedName ?? "Mac" }
+    var accessibilityGranted: Bool { AXIsProcessTrusted() }
+    var appVersion: String {
+        let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
+        let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
+        return "\(v) (\(b))"
+    }
+
+    var launchAtLogin: Bool { SMAppService.mainApp.status == .enabled }
+
+    func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            statusMessage = "Launch at Login failed: \(error.localizedDescription)"
+        }
+        objectWillChange.send()
+    }
+
+    /// Removes a device's pairing so its next connection requires re-approval.
+    func forgetDevice(_ deviceID: String) {
+        securityManager.deleteSharedSecret(for: deviceID)
+        connectedDevices.removeAll { $0.id == deviceID }
+        statusMessage = "Forgot device \(deviceID.prefix(8))…"
+    }
+
+    func openAccessibilitySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
         }
     }
 

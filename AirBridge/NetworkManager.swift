@@ -250,6 +250,19 @@ final class NetworkManager {
     // latency to the event path, so they are excluded from RX logging.
     private static let quietTypes: Set<String> = ["mouse_move", "scroll"]
 
+    // Message types suppressed by "Pause Input".
+    private static let inputTypes: Set<String> = [
+        "mouse_move", "scroll", "mouse_click", "mouse_down", "mouse_up",
+        "key_down", "key_up", "swipe", "action", "nav", "pinch", "media", "type_text"
+    ]
+    // Written on `queue` via setInputPaused; read on `queue` in handleLine.
+    private var inputPaused = false
+
+    /// Thread-safe toggle for suppressing input injection (menu bar / window).
+    func setInputPaused(_ paused: Bool) {
+        queue.async { [weak self] in self?.inputPaused = paused }
+    }
+
     private func handleLine(_ lineData: Data, from connection: NWConnection, box: ConnectionBox) {
         do {
             let obj = try JSONSerialization.jsonObject(with: lineData, options: [])
@@ -266,6 +279,12 @@ final class NetworkManager {
             // inject input nor read system/app information.
             let openTypes: Set<String> = ["hello", "pair_request", "auth_proof"]
             if !openTypes.contains(type) && !box.authenticated {
+                return
+            }
+            // User-controlled "Pause Input": drop injection messages while
+            // paused, but keep handshake, heartbeat, clipboard, and queries
+            // working so the connection stays healthy.
+            if self.inputPaused && Self.inputTypes.contains(type) {
                 return
             }
             switch type {
