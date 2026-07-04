@@ -12,63 +12,122 @@ struct AirBridgeApp: App {
     @StateObject private var appState = AppState()
 
     var body: some Scene {
-        WindowGroup {
+        Window("AirBridge", id: "main") {
             ContentView()
                 .environmentObject(appState)
         }
+        .windowResizability(.contentSize)
+
         Settings {
             ContentView()
                 .environmentObject(appState)
         }
-        // Menu bar presence so AirBridge is controllable when the window is closed.
-        MenuBarExtra("AirBridge", systemImage: "antenna.radiowaves.left.and.right") {
+
+        // Menu bar presence: a mini dashboard, controllable with the window closed.
+        MenuBarExtra {
             MenuBarContent()
                 .environmentObject(appState)
+        } label: {
+            MenuBarLabel()
+                .environmentObject(appState)
         }
+        .menuBarExtraStyle(.window)
     }
 }
 
-/// Compact menu shown from the status bar icon.
-struct MenuBarContent: View {
+/// Status-reflecting menu bar icon: slashed when the server is off, filled
+/// phone when a device is connected, plain antenna otherwise.
+struct MenuBarLabel: View {
     @EnvironmentObject private var appState: AppState
-    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        Group {
-            Text(appState.connectedDevices.isEmpty
-                 ? "No devices connected"
-                 : "\(appState.connectedDevices.count) device\(appState.connectedDevices.count == 1 ? "" : "s") connected")
+        Image(systemName: symbol)
+    }
+
+    private var symbol: String {
+        if !appState.serverEnabled { return "antenna.radiowaves.left.and.right.slash" }
+        if !appState.connectedDevices.isEmpty { return "iphone.radiowaves.left.and.right" }
+        return "antenna.radiowaves.left.and.right"
+    }
+}
+
+/// Mini dashboard shown from the status bar icon (window-style popover).
+struct MenuBarContent: View {
+    @EnvironmentObject private var appState: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                BrandIcon(size: 30)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("AirBridge").font(.headline)
+                    Text(appState.connectedDevices.isEmpty
+                         ? "No devices connected"
+                         : "\(appState.connectedDevices.count) device\(appState.connectedDevices.count == 1 ? "" : "s") · \(appState.eventsPerSecond)/s")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                Spacer()
+                StatusPill()
+            }
+
+            if !appState.connectedDevices.isEmpty {
+                Divider()
+                ForEach(appState.connectedDevices) { device in
+                    HStack(spacing: 8) {
+                        Image(systemName: "iphone")
+                            .foregroundStyle(Color.accentColor)
+                        Text(appState.displayName(for: device.id))
+                            .font(.callout)
+                        Spacer()
+                        if let total = appState.deviceEventTotals[device.id] {
+                            Text("\(total)")
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                }
+            }
 
             Divider()
 
-            Toggle("Pause Input", isOn: $appState.inputPaused)
-
-            Toggle("Launch at Login", isOn: Binding(
-                get: { appState.launchAtLogin },
-                set: { appState.setLaunchAtLogin($0) }
-            ))
-
-            Divider()
-
-            Button("Show Pairing QR…") {
-                NSApp.activate(ignoringOtherApps: true)
-                NSApp.windows.first(where: { $0.canBecomeMain })?.makeKeyAndOrderFront(nil)
-                appState.showPairingQR()
-            }
-
-            Button("Open AirBridge") {
-                NSApp.activate(ignoringOtherApps: true)
-                NSApp.windows.first(where: { $0.canBecomeMain })?.makeKeyAndOrderFront(nil)
-            }
-
-            Text("Version \(appState.appVersion)")
+            Toggle("Advertise on network", isOn: $appState.serverEnabled)
+                .toggleStyle(.switch)
+            Toggle("Pause input", isOn: $appState.inputPaused)
+                .toggleStyle(.switch)
+                .disabled(!appState.serverEnabled)
 
             Divider()
 
-            Button("Quit AirBridge") {
-                NSApp.terminate(nil)
+            HStack {
+                Button {
+                    openMainWindow()
+                    appState.showPairingQR()
+                } label: {
+                    Label("Pair", systemImage: "qrcode")
+                }
+                Button {
+                    openMainWindow()
+                } label: {
+                    Label("Open", systemImage: "macwindow")
+                }
+                Spacer()
+                Button {
+                    NSApp.terminate(nil)
+                } label: {
+                    Label("Quit", systemImage: "power")
+                }
+                .keyboardShortcut("q")
             }
-            .keyboardShortcut("q")
+            .controlSize(.small)
         }
+        .padding(14)
+        .frame(width: 280)
+    }
+
+    private func openMainWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.windows.first(where: { $0.canBecomeMain })?.makeKeyAndOrderFront(nil)
     }
 }

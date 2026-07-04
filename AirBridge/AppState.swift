@@ -109,9 +109,16 @@ final class AppState: ObservableObject {
             self?.logActivity(symbol, text)
         }
         startAccessibilityPolling()
+        // Nested ObservableObjects don't propagate; forward the checker's
+        // changes so the update banner appears without a view poke.
+        updateCancellable = updateChecker.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
         updateChecker.check()
         Task { await networkManager.start() }
     }
+
+    private var updateCancellable: AnyCancellable?
 
     // MARK: - Live metrics (dashboard)
 

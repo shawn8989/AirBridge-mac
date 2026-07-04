@@ -2,7 +2,8 @@
 //  ContentView.swift
 //  AirBridge
 //
-//  Status dashboard: live server state, connected devices, and controls.
+//  The 2.0 dashboard: Status / Devices / Activity tabs, live metrics,
+//  first-run checklist, and quick controls.
 //
 
 import SwiftUI
@@ -11,19 +12,49 @@ import CoreImage
 struct ContentView: View {
     @EnvironmentObject private var appState: AppState
 
+    private enum Tab: String, CaseIterable, Identifiable {
+        case status = "Status"
+        case devices = "Devices"
+        case activity = "Activity"
+        var id: String { rawValue }
+        var icon: String {
+            switch self {
+            case .status: return "gauge.with.dots.needle.50percent"
+            case .devices: return "iphone"
+            case .activity: return "list.bullet.rectangle"
+            }
+        }
+    }
+
+    @State private var tab: Tab = .status
+
     var body: some View {
-        VStack(spacing: 14) {
+        VStack(spacing: 12) {
             header
 
-            devicesCard
+            Picker("", selection: $tab) {
+                ForEach(Tab.allCases) { t in
+                    Label(t.rawValue, systemImage: t.icon).tag(t)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
 
-            controlsCard
+            Group {
+                switch tab {
+                case .status: StatusTab()
+                case .devices: DevicesTab()
+                case .activity: ActivityTab()
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
 
             footer
         }
-        .padding(18)
-        .frame(minWidth: 380, minHeight: 420)
+        .padding(16)
+        .frame(width: 430, height: 560)
         .background(Color(nsColor: .windowBackgroundColor))
+        .animation(.snappy(duration: 0.2), value: appState.connectedDevices)
         .sheet(item: $appState.pendingPairRequest) { request in
             PairingPromptView(request: request) { allowed in
                 Task { await appState.handlePairingDecision(allowed: allowed, request: request) }
@@ -39,21 +70,10 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Header
-
     private var header: some View {
         HStack(spacing: 12) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 12)
-                    .fill(LinearGradient(colors: [Color(red: 0.31, green: 0.27, blue: 0.90),
-                                                  Color(red: 0.15, green: 0.39, blue: 0.92)],
-                                         startPoint: .top, endPoint: .bottom))
-                    .frame(width: 44, height: 44)
-                Image(systemName: "antenna.radiowaves.left.and.right")
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(.white)
-            }
-            VStack(alignment: .leading, spacing: 2) {
+            BrandIcon(size: 42)
+            VStack(alignment: .leading, spacing: 1) {
                 Text("AirBridge")
                     .font(.title2.bold())
                 Text(appState.macName)
@@ -61,134 +81,9 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            statusPill
+            StatusPill()
         }
     }
-
-    private var statusPill: some View {
-        let (color, text): (Color, String) = appState.inputPaused
-            ? (.orange, "Input Paused")
-            : (.green, "Advertising")
-        return HStack(spacing: 6) {
-            Circle().fill(color).frame(width: 8, height: 8)
-            Text(text).font(.caption.weight(.medium))
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
-        .background(color.opacity(0.12), in: Capsule())
-    }
-
-    // MARK: - Devices
-
-    private var devicesCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("Connected Devices", systemImage: "iphone.radiowaves.left.and.right")
-                .font(.subheadline.weight(.semibold))
-
-            if appState.connectedDevices.isEmpty {
-                HStack(spacing: 10) {
-                    Image(systemName: "iphone.slash")
-                        .foregroundStyle(.tertiary)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("No devices connected")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                        Text("Open AirPad on your iPhone — same Wi-Fi network.")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.vertical, 8)
-            } else {
-                ForEach(appState.connectedDevices) { device in
-                    HStack(spacing: 10) {
-                        Image(systemName: "iphone")
-                            .font(.title3)
-                            .foregroundStyle(Color.accentColor)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(String(device.id.prefix(13)) + "…")
-                                .font(.callout.monospaced())
-                            Text("Connected \(device.connectedAt.formatted(date: .omitted, time: .shortened))")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Button("Forget") {
-                            appState.forgetDevice(device.id)
-                        }
-                        .controlSize(.small)
-                        .help("Remove this device's pairing; it will need approval to reconnect.")
-                    }
-                    .padding(8)
-                    .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
-                }
-            }
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-    }
-
-    // MARK: - Controls
-
-    private var controlsCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Label("Controls", systemImage: "switch.2")
-                .font(.subheadline.weight(.semibold))
-
-            Toggle(isOn: $appState.inputPaused) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Pause Input")
-                    Text("Temporarily ignore mouse, keyboard, and gestures from phones.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .toggleStyle(.switch)
-
-            Toggle(isOn: Binding(
-                get: { appState.launchAtLogin },
-                set: { appState.setLaunchAtLogin($0) }
-            )) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Launch at Login")
-                    Text("Start AirBridge automatically so your Mac is always reachable.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .toggleStyle(.switch)
-
-            Button {
-                appState.showPairingQR()
-            } label: {
-                Label("Show Pairing QR…", systemImage: "qrcode")
-            }
-            .help("Pair a new iPhone instantly by scanning — no approval dialog needed.")
-
-            Divider()
-
-            HStack(spacing: 8) {
-                Image(systemName: appState.accessibilityGranted ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                    .foregroundStyle(appState.accessibilityGranted ? .green : .orange)
-                Text(appState.accessibilityGranted
-                     ? "Accessibility permission granted"
-                     : "Accessibility permission needed to control this Mac")
-                    .font(.caption)
-                Spacer()
-                if !appState.accessibilityGranted {
-                    Button("Open Settings") { appState.openAccessibilitySettings() }
-                        .controlSize(.small)
-                }
-            }
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-    }
-
-    // MARK: - Footer
 
     private var footer: some View {
         HStack {
@@ -205,7 +100,412 @@ struct ContentView: View {
     }
 }
 
-/// A sheet prompting the user to allow/deny first-time device pairing.
+// MARK: - Shared bits
+
+struct BrandIcon: View {
+    var size: CGFloat
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: size * 0.27)
+                .fill(LinearGradient(colors: [Color(red: 0.31, green: 0.27, blue: 0.90),
+                                              Color(red: 0.15, green: 0.39, blue: 0.92)],
+                                     startPoint: .top, endPoint: .bottom))
+                .frame(width: size, height: size)
+            Image(systemName: "antenna.radiowaves.left.and.right")
+                .font(.system(size: size * 0.44, weight: .semibold))
+                .foregroundStyle(.white)
+        }
+    }
+}
+
+struct StatusPill: View {
+    @EnvironmentObject private var appState: AppState
+
+    var body: some View {
+        let (color, text): (Color, String) = {
+            if !appState.serverEnabled { return (.gray, "Off") }
+            if appState.inputPaused { return (.orange, "Paused") }
+            if !appState.connectedDevices.isEmpty { return (.green, "Connected") }
+            return (.blue, "Advertising")
+        }()
+        HStack(spacing: 6) {
+            Circle().fill(color).frame(width: 8, height: 8)
+            Text(text).font(.caption.weight(.medium))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(color.opacity(0.12), in: Capsule())
+    }
+}
+
+private struct Card<Content: View>: View {
+    @ViewBuilder var content: Content
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) { content }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+// MARK: - Status tab
+
+private struct StatusTab: View {
+    @EnvironmentObject private var appState: AppState
+    @AppStorage("airbridge.setupDismissed") private var setupDismissed = false
+
+    private var needsSetup: Bool {
+        !appState.accessibilityOK ||
+        (!setupDismissed && appState.knownDeviceIDs.isEmpty && appState.connectedDevices.isEmpty)
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 12) {
+                if let update = appState.updateChecker.available {
+                    updateBanner(update)
+                }
+
+                if needsSetup {
+                    SetupChecklist(dismiss: { setupDismissed = true })
+                }
+
+                liveCard
+
+                controlsCard
+            }
+        }
+        .scrollIndicators(.hidden)
+    }
+
+    private func updateBanner(_ update: UpdateChecker.Update) -> some View {
+        Button {
+            NSWorkspace.shared.open(update.url)
+        } label: {
+            HStack {
+                Image(systemName: "arrow.down.circle.fill")
+                Text("AirBridge \(update.version) is available")
+                    .font(.callout.weight(.medium))
+                Spacer()
+                Text("Get Update")
+                    .font(.callout.weight(.semibold))
+            }
+            .padding(10)
+            .background(Color.accentColor.opacity(0.14), in: RoundedRectangle(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var liveCard: some View {
+        Card {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "dot.radiowaves.left.and.right")
+                            .font(.title3)
+                            .foregroundStyle(appState.serverEnabled ? Color.accentColor : .secondary)
+                            .symbolEffect(.variableColor.iterative.reversing,
+                                          options: .repeating,
+                                          isActive: appState.serverEnabled && !appState.inputPaused)
+                        Text(appState.serverEnabled
+                             ? (appState.connectedDevices.isEmpty ? "Waiting for AirPad…" : "Live")
+                             : "Server is off")
+                            .font(.headline)
+                    }
+                    Text(appState.connectedDevices.isEmpty
+                         ? "Open AirPad on your iPhone — same Wi-Fi network."
+                         : "\(appState.connectedDevices.count) device\(appState.connectedDevices.count == 1 ? "" : "s") connected")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("\(appState.eventsPerSecond)")
+                        .font(.system(size: 26, weight: .bold, design: .rounded))
+                        .monospacedDigit()
+                        .contentTransition(.numericText())
+                        .animation(.snappy, value: appState.eventsPerSecond)
+                    Text("events/sec")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Sparkline(values: appState.recentRates)
+                .frame(height: 36)
+        }
+    }
+
+    private var controlsCard: some View {
+        Card {
+            Label("Controls", systemImage: "switch.2")
+                .font(.subheadline.weight(.semibold))
+
+            Toggle("Advertise on the network", isOn: $appState.serverEnabled)
+                .toggleStyle(.switch)
+            Toggle("Pause input from phones", isOn: $appState.inputPaused)
+                .toggleStyle(.switch)
+                .disabled(!appState.serverEnabled)
+            Toggle("Launch at Login", isOn: Binding(
+                get: { appState.launchAtLogin },
+                set: { appState.setLaunchAtLogin($0) }
+            ))
+            .toggleStyle(.switch)
+            Toggle("Notify on connect / disconnect", isOn: $appState.notifyOnConnect)
+                .toggleStyle(.switch)
+
+            Divider()
+
+            Button {
+                appState.showPairingQR()
+            } label: {
+                Label("Show Pairing QR…", systemImage: "qrcode")
+                    .frame(maxWidth: .infinity)
+            }
+            .controlSize(.large)
+        }
+    }
+}
+
+/// First-run checklist; live-updates as permission is granted / devices pair.
+private struct SetupChecklist: View {
+    @EnvironmentObject private var appState: AppState
+    var dismiss: () -> Void
+
+    var body: some View {
+        Card {
+            HStack {
+                Label("Get set up", systemImage: "sparkles")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                if appState.accessibilityOK {
+                    Button("Hide") { dismiss() }
+                        .controlSize(.small)
+                }
+            }
+
+            checklistRow(done: appState.accessibilityOK,
+                         title: "Allow AirBridge to control this Mac",
+                         subtitle: "System Settings → Privacy & Security → Accessibility") {
+                if !appState.accessibilityOK {
+                    Button("Open Settings") { appState.openAccessibilitySettings() }
+                        .controlSize(.small)
+                }
+            }
+
+            checklistRow(done: !appState.knownDeviceIDs.isEmpty || !appState.connectedDevices.isEmpty,
+                         title: "Get AirPad on your iPhone",
+                         subtitle: "App Store → AirPad, then open it on the same Wi-Fi") { EmptyView() }
+
+            checklistRow(done: !appState.knownDeviceIDs.isEmpty || !appState.connectedDevices.isEmpty,
+                         title: "Pair your iPhone",
+                         subtitle: "Fastest: scan a pairing code") {
+                Button("Show QR") { appState.showPairingQR() }
+                    .controlSize(.small)
+            }
+        }
+    }
+
+    private func checklistRow<Trailing: View>(done: Bool, title: String, subtitle: String,
+                                              @ViewBuilder trailing: () -> Trailing) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: done ? "checkmark.circle.fill" : "circle")
+                .font(.title3)
+                .foregroundStyle(done ? .green : .secondary)
+                .contentTransition(.symbolEffect(.replace))
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.callout.weight(.medium))
+                Text(subtitle).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            trailing()
+        }
+    }
+}
+
+/// Tiny dependency-free sparkline of the recent event rates.
+private struct Sparkline: View {
+    let values: [Int]
+
+    var body: some View {
+        Canvas { context, size in
+            guard values.count > 1 else { return }
+            let maxValue = max(values.max() ?? 1, 10)
+            let stepX = size.width / CGFloat(max(values.count - 1, 1))
+            var path = Path()
+            for (i, v) in values.enumerated() {
+                let x = CGFloat(i) * stepX
+                let y = size.height - (CGFloat(v) / CGFloat(maxValue)) * (size.height - 2) - 1
+                if i == 0 { path.move(to: CGPoint(x: x, y: y)) }
+                else { path.addLine(to: CGPoint(x: x, y: y)) }
+            }
+            context.stroke(path, with: .color(.accentColor), style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+
+            // Soft fill under the line.
+            var fill = path
+            fill.addLine(to: CGPoint(x: size.width, y: size.height))
+            fill.addLine(to: CGPoint(x: 0, y: size.height))
+            fill.closeSubpath()
+            context.fill(fill, with: .linearGradient(
+                Gradient(colors: [Color.accentColor.opacity(0.25), .clear]),
+                startPoint: .zero, endPoint: CGPoint(x: 0, y: size.height)))
+        }
+    }
+}
+
+// MARK: - Devices tab
+
+private struct DevicesTab: View {
+    @EnvironmentObject private var appState: AppState
+    @State private var renamingID: String?
+    @State private var renameText = ""
+
+    private var offlineKnownIDs: [String] {
+        appState.knownDeviceIDs.filter { id in !appState.connectedDevices.contains { $0.id == id } }
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 12) {
+                Card {
+                    Label("Connected", systemImage: "iphone.radiowaves.left.and.right")
+                        .font(.subheadline.weight(.semibold))
+                    if appState.connectedDevices.isEmpty {
+                        Text("No devices connected. Open AirPad on your iPhone — same Wi-Fi network.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .padding(.vertical, 6)
+                    } else {
+                        ForEach(appState.connectedDevices) { device in
+                            deviceRow(id: device.id, connectedAt: device.connectedAt, online: true)
+                        }
+                    }
+                }
+
+                if !offlineKnownIDs.isEmpty {
+                    Card {
+                        Label("Previously Paired", systemImage: "clock.arrow.circlepath")
+                            .font(.subheadline.weight(.semibold))
+                        ForEach(offlineKnownIDs, id: \.self) { id in
+                            deviceRow(id: id, connectedAt: nil, online: false)
+                        }
+                    }
+                }
+            }
+        }
+        .scrollIndicators(.hidden)
+        .alert("Rename Device", isPresented: Binding(
+            get: { renamingID != nil },
+            set: { if !$0 { renamingID = nil } }
+        )) {
+            TextField("Name", text: $renameText)
+            Button("Save") {
+                if let id = renamingID { appState.setNickname(renameText, for: id) }
+                renamingID = nil
+            }
+            Button("Cancel", role: .cancel) { renamingID = nil }
+        } message: {
+            Text("Leave empty to go back to the name the device reports.")
+        }
+    }
+
+    private func deviceRow(id: String, connectedAt: Date?, online: Bool) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: online ? "iphone" : "iphone.slash")
+                .font(.title3)
+                .foregroundStyle(online ? Color.accentColor : .secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(appState.displayName(for: id))
+                    .font(.callout.weight(.semibold))
+                HStack(spacing: 6) {
+                    Text(String(id.prefix(8)) + "…")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.tertiary)
+                    if let connectedAt {
+                        Text("· since \(connectedAt.formatted(date: .omitted, time: .shortened))")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    if online, let total = appState.deviceEventTotals[id] {
+                        Text("· \(total) events")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                }
+            }
+            Spacer()
+            Button {
+                renameText = appState.nicknames[id] ?? appState.deviceNames[id] ?? ""
+                renamingID = id
+            } label: {
+                Image(systemName: "pencil")
+            }
+            .buttonStyle(.borderless)
+            .help("Rename")
+            Button("Forget") {
+                appState.forgetDevice(id)
+                appState.deviceNames.removeValue(forKey: id)
+                appState.nicknames.removeValue(forKey: id)
+            }
+            .controlSize(.small)
+            .help("Remove this device's pairing; it will need approval to reconnect.")
+        }
+        .padding(8)
+        .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+// MARK: - Activity tab
+
+private struct ActivityTab: View {
+    @EnvironmentObject private var appState: AppState
+
+    var body: some View {
+        Card {
+            HStack {
+                Label("Recent Activity", systemImage: "list.bullet.rectangle")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                if !appState.activity.isEmpty {
+                    Button("Clear") { appState.activity.removeAll() }
+                        .controlSize(.small)
+                }
+            }
+            if appState.activity.isEmpty {
+                Text("Nothing yet. Connections, pairings, and clipboard transfers will show up here.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 6)
+            } else {
+                ScrollView {
+                    VStack(spacing: 0) {
+                        ForEach(appState.activity) { entry in
+                            HStack(spacing: 10) {
+                                Image(systemName: entry.symbol)
+                                    .frame(width: 22)
+                                    .foregroundStyle(Color.accentColor)
+                                Text(entry.text)
+                                    .font(.callout)
+                                Spacer()
+                                Text(entry.date, style: .relative)
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .padding(.vertical, 6)
+                            Divider().opacity(0.4)
+                        }
+                    }
+                }
+                .scrollIndicators(.hidden)
+            }
+        }
+        .frame(maxHeight: .infinity)
+    }
+}
+
+// MARK: - Pairing sheets (unchanged behavior)
+
 struct PairingPromptView: View {
     let request: PairRequest
     let onDecision: (Bool) -> Void
