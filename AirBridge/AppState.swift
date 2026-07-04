@@ -10,6 +10,15 @@ import SwiftUI
 import Combine
 import ServiceManagement
 import ApplicationServices
+import UserNotifications
+
+/// One row in the Activity feed.
+struct ActivityEntry: Identifiable, Equatable {
+    let id = UUID()
+    let date = Date()
+    let symbol: String
+    let text: String
+}
 
 /// Represents a first-time pairing request from an unknown device.
 struct PairRequest: Identifiable {
@@ -57,7 +66,10 @@ final class AppState: ObservableObject {
                     if !self.connectedDevices.contains(where: { $0.id == deviceID }) {
                         self.connectedDevices.append(DeviceConnection(id: deviceID, connectedAt: Date()))
                     }
-                    self.statusMessage = "Connected: \(deviceID)"
+                    let name = self.displayName(for: deviceID)
+                    self.statusMessage = "Connected: \(name)"
+                    self.logActivity("iphone.radiowaves.left.and.right", "\(name) connected")
+                    self.notify("AirPad connected", name)
                 }
             },
             onDeviceDisconnected: { [weak self] deviceID in
@@ -65,7 +77,10 @@ final class AppState: ObservableObject {
                     guard let self else { return }
                     if let id = deviceID {
                         self.connectedDevices.removeAll { $0.id == id }
-                        self.statusMessage = "Disconnected: \(id)"
+                        let name = self.displayName(for: id)
+                        self.statusMessage = "Disconnected: \(name)"
+                        self.logActivity("iphone.slash", "\(name) disconnected")
+                        self.notify("AirPad disconnected", name)
                     } else {
                         self.statusMessage = "Disconnected"
                     }
@@ -76,9 +91,135 @@ final class AppState: ObservableObject {
             // Already hopped to main by NetworkManager.
             self?.qrPayload = nil
             self?.statusMessage = "Paired via QR: \(deviceID.prefix(8))…"
+            self?.logActivity("qrcode", "Paired \(self?.displayName(for: deviceID) ?? "a device") via QR")
         }
+        networkManager.onDeviceNamed = { [weak self] deviceID, name in
+            guard let self else { return }
+            // Reported names never override a user-chosen nickname.
+            if self.nicknames[deviceID] == nil { self.deviceNames[deviceID] = name }
+        }
+        networkManager.onMetrics = { [weak self] perSecond, totals in
+            guard let self else { return }
+            self.eventsPerSecond = perSecond
+            self.deviceEventTotals = totals
+            self.recentRates.append(perSecond)
+            if self.recentRates.count > 30 { self.recentRates.removeFirst(self.recentRates.count - 30) }
+        }
+        networkManager.onActivity = { [weak self] symbol, text in
+            self?.logActivity(symbol, text)
+        }
+        startAccessibilityPolling()
+        updateChecker.check()
         Task { await networkManager.start() }
     }
+
+    // MARK: - Live metrics (dashboard)
+
+    @Published var eventsPerSecond: Int = 0
+    @Published var recentRates: [Int] = []
+    @Published var deviceEventTotals: [String: Int] = [:]
+
+    // MARK: - Device names & nicknames
+
+    /// Names reported by devices (hello payload), persisted for offline display.
+    @Published var deviceNames: [String: String] = UserDefaults.standard
+        .dictionary(forKey: "airbridge.deviceNames") as? [String: String] ?? [:] {
+        didSet { UserDefaults.standard.set(deviceNames, forKey: "airbridge.deviceNames") }
+    }
+    /// User-chosen overrides; win over reported names.
+    @Published var nicknames: [String: String] = UserDefaults.standard
+        .dictionary(forKey: "airbridge.nicknames") as? [String: String] ?? [:] {
+        didSet { UserDefaults.standard.set(nicknames, forKey: "airbridge.nicknames") }
+    }
+
+    func displayName(for deviceID: String) -> String {
+        nicknames[deviceID] ?? deviceNames[deviceID] ?? String(deviceID.prefix(8)) + "…"
+    }
+
+    func setNickname(_ name: String, for deviceID: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty {
+            nicknames.removeValue(forKey: deviceID)
+        } else {
+            nicknames[deviceID] = trimmed
+        }
+    }
+
+    /// Every device we know a name for — drives the "previously paired" list.
+    var knownDeviceIDs: [String] {
+        Array(Set(deviceNames.keys).union(nicknames.keys)).sorted {
+            displayName(for: $0).localizedCaseInsensitiveCompare(displayName(for: $1)) == .orderedAscending
+        }
+    }
+
+    // MARK: - Activity log
+
+    @Published var activity: [ActivityEntry] = []
+
+    func logActivity(_ symbol: String, _ text: String) {
+        activity.insert(ActivityEntry(symbol: symbol, text: text), at: 0)
+        if activity.count > 100 { activity.removeLast(activity.count - 100) }
+    }
+
+    // MARK: - Notifications
+
+    @Published var notifyOnConnect: Bool = UserDefaults.standard.object(forKey: "airbridge.notifyOnConnect") == nil
+        ? true
+        : UserDefaults.standard.bool(forKey: "airbridge.notifyOnConnect") {
+        didSet { UserDefaults.standard.set(notifyOnConnect, forKey: "airbridge.notifyOnConnect") }
+    }
+    private var notificationAuthRequested = false
+
+    /// Posts a local notification — only when the app isn't frontmost, so it
+    /// informs without nagging.
+    func notify(_ title: String, _ body: String) {
+        guard notifyOnConnect, !NSApp.isActive else { return }
+        let center = UNUserNotificationCenter.current()
+        let post = {
+            let content = UNMutableNotificationContent()
+            content.title = title
+            content.body = body
+            center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+        }
+        if notificationAuthRequested {
+            post()
+        } else {
+            notificationAuthRequested = true
+            center.requestAuthorization(options: [.alert]) { granted, _ in
+                if granted { post() }
+            }
+        }
+    }
+
+    // MARK: - Server on/off
+
+    @Published var serverEnabled = true {
+        didSet {
+            networkManager.setServerEnabled(serverEnabled)
+            logActivity(serverEnabled ? "antenna.radiowaves.left.and.right" : "antenna.radiowaves.left.and.right.slash",
+                        serverEnabled ? "Advertising resumed" : "Advertising stopped")
+            if !serverEnabled { connectedDevices.removeAll() }
+        }
+    }
+
+    // MARK: - Accessibility polling (live onboarding checklist)
+
+    @Published var accessibilityOK = AXIsProcessTrusted()
+    private var axTimer: Timer?
+
+    private func startAccessibilityPolling() {
+        axTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                let ok = AXIsProcessTrusted()
+                if ok != self.accessibilityOK { self.accessibilityOK = ok }
+            }
+        }
+    }
+
+    // MARK: - Updates
+
+    let updateChecker = UpdateChecker()
 
     // MARK: - QR pairing UI state
 
@@ -130,7 +271,11 @@ final class AppState: ObservableObject {
 
     /// Suppresses input injection while leaving the connection healthy.
     @Published var inputPaused = false {
-        didSet { networkManager.setInputPaused(inputPaused) }
+        didSet {
+            networkManager.setInputPaused(inputPaused)
+            logActivity(inputPaused ? "pause.circle" : "play.circle",
+                        inputPaused ? "Input paused" : "Input resumed")
+        }
     }
 
     var macName: String { Host.current().localizedName ?? "Mac" }
@@ -182,12 +327,14 @@ final class AppState: ObservableObject {
         if allowed {
             do {
                 try securityManager.storeSharedSecret(request.proposedSecret, for: request.deviceID)
-                statusMessage = "Paired with \(request.deviceID)"
+                statusMessage = "Paired with \(displayName(for: request.deviceID))"
+                logActivity("checkmark.seal", "Paired \(displayName(for: request.deviceID))")
             } catch {
                 statusMessage = "Keychain error: \(error.localizedDescription)"
             }
         } else {
-            statusMessage = "Connection denied for \(request.deviceID)"
+            statusMessage = "Connection denied for \(displayName(for: request.deviceID))"
+            logActivity("xmark.seal", "Denied pairing for \(displayName(for: request.deviceID))")
         }
     }
 }

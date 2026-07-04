@@ -164,6 +164,7 @@ final class NetworkManager {
     }
 
     private func _start() {
+        startMetricsTimer()
         // Shared-key TLS-PSK listener (known-working transport). The server-side
         // per-device PSK *selection block* did not complete the TLS handshake in
         // practice, so the channel uses one shared key for encryption and we
@@ -206,6 +207,7 @@ final class NetworkManager {
         let box = ConnectionBox(secret: secret)
         let key = ObjectIdentifier(connection)
         connectionBoxes[key] = box
+        activeConnections[key] = connection
         print("[AirBridge] Accepted connection: \(connection)")
         // Removed: initial pair_response send on accept per instructions.
 
@@ -234,6 +236,7 @@ final class NetworkManager {
             if isComplete || error != nil {
                 let deviceID = box.deviceID
                 self.connectionBoxes.removeValue(forKey: key)
+                self.activeConnections.removeValue(forKey: key)
                 self.onDeviceDisconnected(deviceID)
                 // Safety: a dropped connection must not leave synthetic modifier
                 // keys latched (a stuck Ctrl turns every left click into a right
@@ -261,6 +264,60 @@ final class NetworkManager {
     /// Thread-safe toggle for suppressing input injection (menu bar / window).
     func setInputPaused(_ paused: Bool) {
         queue.async { [weak self] in self?.inputPaused = paused }
+    }
+
+    // MARK: - UI feed (all callbacks delivered on main)
+
+    /// A device reported its human-readable name in hello.
+    var onDeviceNamed: ((_ deviceID: String, _ name: String) -> Void)?
+    /// Periodic metrics: input events/sec + cumulative per-device totals.
+    var onMetrics: ((_ eventsPerSecond: Int, _ perDeviceTotals: [String: Int]) -> Void)?
+    /// Noteworthy happenings for the activity log: (SF Symbol, text).
+    var onActivity: ((_ symbol: String, _ text: String) -> Void)?
+
+    // Owned by `queue`.
+    private var metricsTimer: DispatchSourceTimer?
+    private var eventsInWindow = 0
+    private var perDeviceTotals: [String: Int] = [:]
+    private var activeConnections: [ObjectIdentifier: NWConnection] = [:]
+
+    private func startMetricsTimer() {
+        guard metricsTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 0.5, repeating: 0.5)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let perSecond = self.eventsInWindow * 2
+            self.eventsInWindow = 0
+            let totals = self.perDeviceTotals
+            let handler = self.onMetrics
+            DispatchQueue.main.async { handler?(perSecond, totals) }
+        }
+        timer.resume()
+        metricsTimer = timer
+    }
+
+    /// Start/stop advertising entirely (distinct from Pause Input, which keeps
+    /// connections alive). Stopping also drops current connections.
+    func setServerEnabled(_ enabled: Bool) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if enabled {
+                guard self.listener == nil else { return }
+                self._start()
+            } else {
+                self.listener?.cancel()
+                self.listener = nil
+                for (_, connection) in self.activeConnections { connection.cancel() }
+                self.activeConnections.removeAll()
+                self.connectionBoxes.removeAll()
+            }
+        }
+    }
+
+    private func emitActivity(_ symbol: String, _ text: String) {
+        let handler = onActivity
+        DispatchQueue.main.async { handler?(symbol, text) }
     }
 
     // MARK: - QR pairing
@@ -315,10 +372,19 @@ final class NetworkManager {
             if self.inputPaused && Self.inputTypes.contains(type) {
                 return
             }
+            // Live metrics for the dashboard (counted only when executed).
+            if Self.inputTypes.contains(type) {
+                eventsInWindow += 1
+                if let id = box.deviceID { perDeviceTotals[id, default: 0] += 1 }
+            }
             switch type {
             case "hello":
                 if let payload = dict["payload"] as? [String: Any], let deviceID = payload["deviceID"] as? String {
                     box.deviceID = deviceID
+                    if let name = payload["deviceName"] as? String, !name.isEmpty {
+                        let handler = self.onDeviceNamed
+                        DispatchQueue.main.async { handler?(deviceID, name) }
+                    }
                     // Tell the client which Mac this is so it can select/store the
                     // matching per-device key (enables one iPhone <-> many Macs).
                     self.sendLine(connection, jsonObject: [
@@ -554,10 +620,12 @@ final class NetworkManager {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(text, forType: .string)
                     }
+                    self.emitActivity("doc.on.clipboard", "Clipboard received from iPhone")
                 }
                 #endif
             case "clipboard_get":
                 #if os(macOS)
+                self.emitActivity("arrow.up.doc.on.clipboard", "Mac clipboard sent to iPhone")
                 DispatchQueue.main.async { [weak self] in
                     let text = NSPasteboard.general.string(forType: .string) ?? ""
                     self?.queue.async {
