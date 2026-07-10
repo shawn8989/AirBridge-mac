@@ -1,60 +1,67 @@
-# AirBridge (macOS client)
+# AirBridge
 
-AirBridge is the macOS client companion for the AirPad iOS app. It provides network connectivity and local input/event injection for controlling or interfacing with AirPad devices.
+**The macOS companion for [AirPad](https://github.com/shawn8989/AirPad)** —
+turn your iPhone into a trackpad, keyboard, Wii-style air mouse, and camera
+hand-gesture controller for your Mac.
 
-## Prerequisites
+**Landing page & download:** https://shawn8989.github.io/AirBridge-mac/ ·
+[Privacy policy](https://shawn8989.github.io/AirBridge-mac/privacy.html)
 
-- macOS (recommended latest stable)
-- Xcode 15+ (or the version used to develop the app)
-- Xcode Command Line Tools (`xcode-select --install`)
-- Git
-- (Optional) GitHub CLI (`gh`) if you want the assistant to create the remote repo for you.
+---
 
-## Building
+## What it does
 
-Open the project in Xcode:
+AirBridge advertises your Mac on the local network (Bonjour), authenticates
+paired iPhones, and injects their input — cursor, clicks, scrolling, gestures,
+keyboard, media keys, clipboard, dictation — using the macOS Accessibility APIs.
 
-1. Double-click `AirBridge.xcodeproj` or run:
+### The dashboard
+- **Status** — animated live indicator, events-per-second meter with a
+  sparkline, update-available banner, and all controls: advertise on/off,
+  pause input, Launch at Login, notifications, pairing QR. A first-run
+  checklist walks new users through Accessibility permission and pairing.
+- **Devices** — connected iPhones by name (editable nicknames), per-device
+  event counts, and per-device Forget (revokes pairing); previously paired
+  devices listed too.
+- **Activity** — a live feed of connections, pairings, clipboard transfers,
+  and pauses.
+- **Menu bar** — a mini dashboard popover with a status-reflecting icon, so
+  the window can stay closed.
+
+### Security
+- Local network only; TLS-encrypted; the Mac is never exposed to the internet.
+- Every device is explicitly paired (approval dialog or one-time QR code) and
+  authenticated with an HMAC-SHA256 challenge on every connection.
+- Revoke any device at any time with Forget.
+
+## Requirements
+
+- macOS 14 or later.
+- **Accessibility permission** (System Settings → Privacy & Security →
+  Accessibility) — required to move the cursor and type on your behalf.
+- AirPad on an iPhone, same Wi-Fi network.
+
+## Install
+
+Download the notarized DMG from
+[Releases](https://github.com/shawn8989/AirBridge-mac/releases/latest), drag
+AirBridge to Applications, open it, and follow the in-app checklist.
+
+> AirBridge is distributed outside the Mac App Store because apps that inject
+> input require the Accessibility permission, which App Store rules don't
+> allow. Builds are Developer ID-signed and notarized by Apple.
+
+## Building from source
 
 ```bash
-open AirBridge.xcodeproj
+open AirBridge.xcodeproj      # Xcode 16+, select your team, Run
 ```
 
-Or build from the terminal (unsigned, non-invasive smoke build):
+- `scripts/make-dmg.sh` — archives, signs (Developer ID), notarizes, and
+  packages the distribution DMG.
+- `.github/workflows/build.yml` — CI compiles the app on every push.
+- `docs/` — the landing page + privacy policy (GitHub Pages from `/docs`).
 
-```bash
-xcodebuild -project AirBridge/AirBridge.xcodeproj -scheme AirBridge -configuration Debug clean build CODE_SIGNING_ALLOWED=NO
-```
+## Author
 
-If the project uses an `.xcworkspace`, replace `-project` with `-workspace` and `-scheme` appropriately.
-
-## Running tests
-
-Run unit/UI tests from Xcode, or via terminal:
-
-```bash
-xcodebuild -project AirBridge/AirBridge.xcodeproj -scheme AirBridge -configuration Debug -destination 'platform=macOS' test CODE_SIGNING_ALLOWED=NO
-```
-
-## Git & Publishing
-
-Steps the assistant will perform when you ask it to push:
-
-1. Scan repository for secrets and large files.
-2. Add `.gitignore` (already added).
-3. Create `README.md` (already added).
-4. Initialize git (if missing) and create an initial commit.
-5. Offer two push options:
-   - Use GitHub CLI (`gh`) to create a repo and push.
-   - You create an empty GitHub repo and provide the remote URL; the assistant will set `origin` and push.
-
-## Security notes
-
-- Do not commit private keys (`*.p12`, `*.key`), provisioning profiles (`*.mobileprovision`), or other secrets. If these exist, remove them and rotate credentials.
-- `AirBridge/AirBridge.entitlements` is included but should be reviewed for team IDs or provisioning details. Consider keeping a sanitized template (e.g., `AirBridge.entitlements.template`) in the repo and ignoring the real entitlements file.
-
-## Troubleshooting
-
-- If `xcodebuild` fails due to code signing, use `CODE_SIGNING_ALLOWED=NO` for smoke builds.
-- If workspace has CocoaPods, run `pod install` before opening the workspace.
-
+Shunathon Owens — Software Engineering • iOS • macOS • Systems
