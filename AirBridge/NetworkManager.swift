@@ -614,6 +614,25 @@ final class NetworkManager {
                     try? self.eventInjector.handleMedia(action: action)
                 }
                 #endif
+            case "now_playing_get":
+                // Current track (Music/Spotify) + system volume for the phone's
+                // media screen. NSAppleScript must run on the main thread.
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    let payload = self.fetchNowPlaying()
+                    self.queue.async {
+                        self.sendLine(connection, jsonObject: ["type": "now_playing", "payload": payload])
+                    }
+                }
+            case "set_volume":
+                if let payload = dict["payload"] as? [String: Any] {
+                    let level = (payload["level"] as? Int) ?? Int(payload["level"] as? Double ?? -1)
+                    if (0...100).contains(level) {
+                        DispatchQueue.main.async { [weak self] in
+                            _ = self?.runAppleScript("set volume output volume \(level)")
+                        }
+                    }
+                }
             case "type_text":
                 // Types a whole string on the Mac (dictation, clipboard paste-through).
                 if let payload = dict["payload"] as? [String: Any], let text = payload["text"] as? String {
@@ -1364,6 +1383,54 @@ private extension NetworkManager {
             print("[NetworkManager] Mission Control launch failed (\(error)); falling back to Ctrl+Arrow")
             try? eventInjector.handleSwipe(fingers: fallbackFingers, direction: appExpose ? "down" : "up")
         }
+    }
+
+    /// Runs an AppleScript snippet; MUST be called on the main thread.
+    func runAppleScript(_ source: String) -> NSAppleEventDescriptor? {
+        var error: NSDictionary?
+        let result = NSAppleScript(source: source)?.executeAndReturnError(&error)
+        if let error {
+            print("[NetworkManager] AppleScript error: \(error[NSAppleScript.errorBriefMessage] ?? error)")
+            return nil
+        }
+        return result
+    }
+
+    /// Current track from Music or Spotify (whichever is playing) + system
+    /// volume. Main thread only. First use prompts the user to allow AirBridge
+    /// to control Music/Spotify (Automation permission).
+    func fetchNowPlaying() -> [String: Any] {
+        var payload: [String: Any] = ["playing": false]
+
+        if let vol = runAppleScript("output volume of (get volume settings)") {
+            payload["volume"] = Int(vol.int32Value)
+        }
+        if let muted = runAppleScript("output muted of (get volume settings)") {
+            payload["muted"] = muted.booleanValue
+        }
+
+        for app in ["Music", "Spotify"] {
+            let script = """
+            if application "\(app)" is running then
+                tell application "\(app)"
+                    if player state is playing then
+                        return (name of current track) & "\u{0001}" & (artist of current track)
+                    end if
+                end tell
+            end if
+            return ""
+            """
+            if let result = runAppleScript(script),
+               let string = result.stringValue, !string.isEmpty {
+                let parts = string.components(separatedBy: "\u{0001}")
+                payload["playing"] = true
+                payload["title"] = parts.first ?? ""
+                payload["artist"] = parts.count > 1 ? parts[1] : ""
+                payload["app"] = app
+                break
+            }
+        }
+        return payload
     }
 
     func _enumerateOpenWindows() throws -> [[String: Any]] {
