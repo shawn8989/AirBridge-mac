@@ -86,6 +86,26 @@ final class EventInjector {
         move.post(tap: .cghidEventTap)
     }
 
+    /// Moves the cursor to an absolute, display-normalized position (0...1 on
+    /// the main display). Powers "tap what you see" on the Live Screen view.
+    func moveMouseAbsolute(nx: Double, ny: Double) throws {
+        let bounds = CGDisplayBounds(CGMainDisplayID())
+        let point = CGPoint(x: bounds.origin.x + bounds.width * CGFloat(min(max(nx, 0), 1)),
+                            y: bounds.origin.y + bounds.height * CGFloat(min(max(ny, 0), 1)))
+        if !didAssociateCursor {
+            _ = CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+            didAssociateCursor = true
+        }
+        CGWarpMouseCursorPosition(point)
+        let leftDown = CGEventSource.buttonState(.combinedSessionState, button: .left)
+        let type: CGEventType = leftDown ? .leftMouseDragged : .mouseMoved
+        guard let move = CGEvent(mouseEventSource: moveSource, mouseType: type,
+                                 mouseCursorPosition: point, mouseButton: .left) else {
+            throw InjectError.eventCreateFailed
+        }
+        move.post(tap: .cghidEventTap)
+    }
+
     func clickMouse(kind: MouseClickKind) throws {
         print("[EventInjector] clickMouse kind=\(kind)")
         // Defensive: a stale latched button (an up event lost to a hiccup)

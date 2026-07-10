@@ -251,11 +251,11 @@ final class NetworkManager {
 
     // High-rate input types arrive up to ~120/s; logging each one adds real
     // latency to the event path, so they are excluded from RX logging.
-    private static let quietTypes: Set<String> = ["mouse_move", "scroll"]
+    private static let quietTypes: Set<String> = ["mouse_move", "mouse_move_abs", "scroll"]
 
     // Message types suppressed by "Pause Input".
     private static let inputTypes: Set<String> = [
-        "mouse_move", "scroll", "mouse_click", "mouse_down", "mouse_up",
+        "mouse_move", "mouse_move_abs", "scroll", "mouse_click", "mouse_down", "mouse_up",
         "key_down", "key_up", "swipe", "action", "nav", "pinch", "media", "type_text"
     ]
     // Written on `queue` via setInputPaused; read on `queue` in handleLine.
@@ -510,6 +510,12 @@ final class NetworkManager {
                 if let payload = dict["payload"] as? [String: Any], let button = payload["button"] as? String {
                     let kind: MouseClickKind = (button == "right" ? .right : button == "middle" ? .middle : .left)
                     try? self.eventInjector.clickMouse(kind: kind)
+                }
+            case "mouse_move_abs":
+                // Absolute, display-normalized cursor position (Live Screen touch).
+                if let payload = dict["payload"] as? [String: Any],
+                   let x = payload["x"] as? Double, let y = payload["y"] as? Double {
+                    try? self.eventInjector.moveMouseAbsolute(nx: x, ny: y)
                 }
             case "move", "mouse_move", "cursor_move", "air_mouse":
                 if let payload = dict["payload"] as? [String: Any] {
