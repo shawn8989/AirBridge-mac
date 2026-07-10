@@ -7,6 +7,9 @@
 
 import Foundation
 import CoreGraphics
+#if os(macOS)
+import AppKit
+#endif
 
 enum MouseClickKind: String, Codable {
     case left, right, middle
@@ -48,12 +51,21 @@ struct AirPacketRaw: Codable {
 final class EventInjector {
     enum InjectError: Error { case eventCreateFailed }
 
+    // Reused across events: allocating a CGEventSource per move (up to 120/s)
+    // is measurable overhead on the injection path.
+    private let moveSource = CGEventSource(stateID: .hidSystemState)
+    private var didAssociateCursor = false
+
     func moveMouse(dx: Double, dy: Double) throws {
-        let source = CGEventSource(stateID: .hidSystemState)
+        let source = moveSource
         let loc = CGEvent(source: nil)?.location ?? .zero
         let newPoint = CGPoint(x: loc.x + dx, y: loc.y + dy)
-        // Ensure the mouse and cursor positions are associated (sometimes required for programmatic movement).
-        _ = CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+        // Ensure the mouse and cursor positions are associated (sometimes
+        // required for programmatic movement). Once is enough.
+        if !didAssociateCursor {
+            _ = CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+            didAssociateCursor = true
+        }
 
         // Move the cursor immediately; some apps/contexts only honor warping.
         CGWarpMouseCursorPosition(newPoint)
@@ -70,7 +82,7 @@ final class EventInjector {
         else { eventType = .mouseMoved; button = .left }
 
         guard let move = CGEvent(mouseEventSource: source, mouseType: eventType, mouseCursorPosition: newPoint, mouseButton: button) else { throw InjectError.eventCreateFailed }
-        print("[EventInjector] moveMouse dx=\(dx) dy=\(dy) -> \(newPoint) type=\(eventType)")
+        // No logging here: this runs up to ~120x/s and printing adds latency.
         move.post(tap: .cghidEventTap)
     }
 
@@ -90,12 +102,20 @@ final class EventInjector {
         }
         guard let down = CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: pos, mouseButton: button),
               let up = CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: pos, mouseButton: button) else { throw InjectError.eventCreateFailed }
+        // Clear modifier flags explicitly: a latched synthetic Ctrl (from the
+        // keyboard's modifier toggles or an interrupted chord) otherwise rides
+        // along and macOS treats Ctrl+LeftClick as a RIGHT click (context menu).
+        down.flags = []
+        up.flags = []
+        // Proper single-click semantics; some apps ignore clicks without it.
+        down.setIntegerValueField(.mouseEventClickState, value: 1)
+        up.setIntegerValueField(.mouseEventClickState, value: 1)
         down.post(tap: .cghidEventTap)
         up.post(tap: .cghidEventTap)
     }
 
     func scroll(dx: Double, dy: Double) throws {
-        print("[EventInjector] scroll dx=\(dx) dy=\(dy)")
+        // No logging here: high-rate path, printing adds latency.
         // Use pixel-based scrolling for smooth trackpad-like behavior.
         let pixelsY = Int32(dy)
         let pixelsX = Int32(dx)
@@ -113,6 +133,20 @@ final class EventInjector {
         print("[EventInjector] keyUp keyCode=\(keyCode)")
         guard let ev = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else { throw InjectError.eventCreateFailed }
         ev.post(tap: .cghidEventTap)
+    }
+
+    /// Releases every modifier key. Called when a client disconnects so a
+    /// dropped connection can never leave Cmd/Ctrl/Opt/Shift/Fn latched down
+    /// (a stuck Ctrl makes every left click behave as a right click).
+    func releaseAllModifiers() {
+        print("[EventInjector] releaseAllModifiers")
+        let modifierKeyCodes: [CGKeyCode] = [55, 58, 59, 56, 63] // Cmd, Opt, Ctrl, Shift, Fn
+        for code in modifierKeyCodes {
+            if let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) {
+                up.flags = []
+                up.post(tap: .cghidEventTap)
+            }
+        }
     }
 }
 
@@ -134,6 +168,8 @@ extension EventInjector {
         guard let down = CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: pos, mouseButton: button) else {
             throw InjectError.eventCreateFailed
         }
+        down.flags = []  // never let a latched modifier turn this into Ctrl+click
+        down.setIntegerValueField(.mouseEventClickState, value: 1)
         down.post(tap: .cghidEventTap)
     }
 
@@ -154,6 +190,8 @@ extension EventInjector {
         guard let up = CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: pos, mouseButton: button) else {
             throw InjectError.eventCreateFailed
         }
+        up.flags = []  // never let a latched modifier turn this into Ctrl+click
+        up.setIntegerValueField(.mouseEventClickState, value: 1)
         up.post(tap: .cghidEventTap)
     }
 }
@@ -273,3 +311,83 @@ extension EventInjector {
         up.post(tap: .cghidEventTap)
     }
 }
+
+#if os(macOS)
+extension EventInjector {
+    /// Media and system controls. Volume/brightness/playback are NOT normal
+    /// key codes — they are NX_KEYTYPE_* "system-defined" events, which is why
+    /// they go through NSEvent.otherEvent rather than CGEvent keyboard events.
+    func handleMedia(action: String) throws {
+        print("[EventInjector] handleMedia action=\(action)")
+        switch action {
+        case "volume_up":       postSystemKey(0)   // NX_KEYTYPE_SOUND_UP
+        case "volume_down":     postSystemKey(1)   // NX_KEYTYPE_SOUND_DOWN
+        case "mute":            postSystemKey(7)   // NX_KEYTYPE_MUTE
+        case "play_pause":      postSystemKey(16)  // NX_KEYTYPE_PLAY
+        case "next":            postSystemKey(17)  // NX_KEYTYPE_NEXT
+        case "previous":        postSystemKey(18)  // NX_KEYTYPE_PREVIOUS
+        case "brightness_up":   postSystemKey(2)   // NX_KEYTYPE_BRIGHTNESS_UP
+        case "brightness_down": postSystemKey(3)   // NX_KEYTYPE_BRIGHTNESS_DOWN
+        case "lock_screen":     try lockScreen()
+        default: break
+        }
+    }
+
+    private func postSystemKey(_ key: Int32) {
+        func post(down: Bool) {
+            let data1 = Int((Int32(key) << 16) | Int32(down ? 0x0A00 : 0x0B00))
+            guard let ev = NSEvent.otherEvent(with: .systemDefined,
+                                              location: .zero,
+                                              modifierFlags: NSEvent.ModifierFlags(rawValue: down ? 0xA00 : 0xB00),
+                                              timestamp: ProcessInfo.processInfo.systemUptime,
+                                              windowNumber: 0,
+                                              context: nil,
+                                              subtype: 8,
+                                              data1: data1,
+                                              data2: -1) else { return }
+            ev.cgEvent?.post(tap: .cghidEventTap)
+        }
+        post(down: true)
+        post(down: false)
+    }
+
+    /// Types an arbitrary string by attaching unicode payloads to key events —
+    /// works for any text without needing per-character key-code mapping.
+    /// CGEvent accepts a limited unicode run per event, so long strings are
+    /// sent in small chunks.
+    func typeText(_ text: String) throws {
+        print("[EventInjector] typeText length=\(text.count)")
+        let units = Array(text.utf16)
+        let chunkSize = 16
+        var i = 0
+        while i < units.count {
+            let chunk = Array(units[i..<min(i + chunkSize, units.count)])
+            guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+                throw InjectError.eventCreateFailed
+            }
+            down.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+            up.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+            i += chunkSize
+            // Tiny pause keeps fast consumers (terminals, web inputs) from dropping chunks.
+            usleep(4000)
+        }
+    }
+
+    /// Locks the screen via the system shortcut Ctrl+Cmd+Q.
+    private func lockScreen() throws {
+        let qKey: CGKeyCode = 12
+        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: qKey, keyDown: true),
+              let up = CGEvent(keyboardEventSource: nil, virtualKey: qKey, keyDown: false) else {
+            throw InjectError.eventCreateFailed
+        }
+        let flags: CGEventFlags = [.maskCommand, .maskControl]
+        down.flags = flags
+        up.flags = flags
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+    }
+}
+#endif

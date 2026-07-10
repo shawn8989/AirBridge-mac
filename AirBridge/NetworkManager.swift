@@ -164,6 +164,7 @@ final class NetworkManager {
     }
 
     private func _start() {
+        startMetricsTimer()
         // Shared-key TLS-PSK listener (known-working transport). The server-side
         // per-device PSK *selection block* did not complete the TLS handshake in
         // practice, so the channel uses one shared key for encryption and we
@@ -206,6 +207,7 @@ final class NetworkManager {
         let box = ConnectionBox(secret: secret)
         let key = ObjectIdentifier(connection)
         connectionBoxes[key] = box
+        activeConnections[key] = connection
         print("[AirBridge] Accepted connection: \(connection)")
         // Removed: initial pair_response send on accept per instructions.
 
@@ -234,7 +236,12 @@ final class NetworkManager {
             if isComplete || error != nil {
                 let deviceID = box.deviceID
                 self.connectionBoxes.removeValue(forKey: key)
+                self.activeConnections.removeValue(forKey: key)
                 self.onDeviceDisconnected(deviceID)
+                // Safety: a dropped connection must not leave synthetic modifier
+                // keys latched (a stuck Ctrl turns every left click into a right
+                // click system-wide).
+                self.eventInjector.releaseAllModifiers()
                 connection.cancel()
                 return
             }
@@ -242,13 +249,113 @@ final class NetworkManager {
         }
     }
 
+    // High-rate input types arrive up to ~120/s; logging each one adds real
+    // latency to the event path, so they are excluded from RX logging.
+    private static let quietTypes: Set<String> = ["mouse_move", "scroll"]
+
+    // Message types suppressed by "Pause Input".
+    private static let inputTypes: Set<String> = [
+        "mouse_move", "scroll", "mouse_click", "mouse_down", "mouse_up",
+        "key_down", "key_up", "swipe", "action", "nav", "pinch", "media", "type_text"
+    ]
+    // Written on `queue` via setInputPaused; read on `queue` in handleLine.
+    private var inputPaused = false
+
+    /// Thread-safe toggle for suppressing input injection (menu bar / window).
+    func setInputPaused(_ paused: Bool) {
+        queue.async { [weak self] in self?.inputPaused = paused }
+    }
+
+    // MARK: - UI feed (all callbacks delivered on main)
+
+    /// A device reported its human-readable name in hello.
+    var onDeviceNamed: ((_ deviceID: String, _ name: String) -> Void)?
+    /// Periodic metrics: input events/sec + cumulative per-device totals.
+    var onMetrics: ((_ eventsPerSecond: Int, _ perDeviceTotals: [String: Int]) -> Void)?
+    /// Noteworthy happenings for the activity log: (SF Symbol, text).
+    var onActivity: ((_ symbol: String, _ text: String) -> Void)?
+
+    // Owned by `queue`.
+    private var metricsTimer: DispatchSourceTimer?
+    private var eventsInWindow = 0
+    private var perDeviceTotals: [String: Int] = [:]
+    private var activeConnections: [ObjectIdentifier: NWConnection] = [:]
+
+    private func startMetricsTimer() {
+        guard metricsTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 0.5, repeating: 0.5)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let perSecond = self.eventsInWindow * 2
+            self.eventsInWindow = 0
+            let totals = self.perDeviceTotals
+            let handler = self.onMetrics
+            DispatchQueue.main.async { handler?(perSecond, totals) }
+        }
+        timer.resume()
+        metricsTimer = timer
+    }
+
+    /// Start/stop advertising entirely (distinct from Pause Input, which keeps
+    /// connections alive). Stopping also drops current connections.
+    func setServerEnabled(_ enabled: Bool) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if enabled {
+                guard self.listener == nil else { return }
+                self._start()
+            } else {
+                self.listener?.cancel()
+                self.listener = nil
+                for (_, connection) in self.activeConnections { connection.cancel() }
+                self.activeConnections.removeAll()
+                self.connectionBoxes.removeAll()
+            }
+        }
+    }
+
+    private func emitActivity(_ symbol: String, _ text: String) {
+        let handler = onActivity
+        DispatchQueue.main.async { handler?(symbol, text) }
+    }
+
+    // MARK: - QR pairing
+    // One active QR secret at a time; valid 2 minutes or until first use.
+    private var activeQRSecret: (secret: Data, expires: Date)?
+    /// Called (on main) when a device pairs via QR so the UI can close the code.
+    var onQRPaired: ((String) -> Void)?
+
+    /// Generates a fresh QR pairing secret and returns the JSON string to
+    /// encode in the QR code. Called from the UI (any thread).
+    func beginQRPairing() -> String {
+        let secret = security.generateNonce(length: 32)
+        queue.async { [weak self] in
+            self?.activeQRSecret = (secret, Date().addingTimeInterval(120))
+        }
+        let payload: [String: Any] = [
+            "v": 1,
+            "macID": machineID(),
+            "macName": machineName(),
+            "qrSecret": secret.base64EncodedString()
+        ]
+        let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    /// Invalidates any outstanding QR secret (window closed / expired).
+    func cancelQRPairing() {
+        queue.async { [weak self] in self?.activeQRSecret = nil }
+    }
+
     private func handleLine(_ lineData: Data, from connection: NWConnection, box: ConnectionBox) {
-        guard let raw = String(data: lineData, encoding: .utf8) else { return }
-        print("[AirBridge] RX line: \(raw)")
         do {
             let obj = try JSONSerialization.jsonObject(with: lineData, options: [])
             guard let dict = obj as? [String: Any], let type = dict["type"] as? String else {
                 throw NSError(domain: "AirBridge", code: -1, userInfo: [NSLocalizedDescriptionKey: "Missing type field"])
+            }
+            if !Self.quietTypes.contains(type), let raw = String(data: lineData, encoding: .utf8) {
+                print("[AirBridge] RX line: \(raw)")
             }
             // Gate all functional messages until the connection has proven
             // knowledge of the device's per-device shared secret via the
@@ -259,16 +366,53 @@ final class NetworkManager {
             if !openTypes.contains(type) && !box.authenticated {
                 return
             }
+            // User-controlled "Pause Input": drop injection messages while
+            // paused, but keep handshake, heartbeat, clipboard, and queries
+            // working so the connection stays healthy.
+            if self.inputPaused && Self.inputTypes.contains(type) {
+                return
+            }
+            // Live metrics for the dashboard (counted only when executed).
+            if Self.inputTypes.contains(type) {
+                eventsInWindow += 1
+                if let id = box.deviceID { perDeviceTotals[id, default: 0] += 1 }
+            }
             switch type {
             case "hello":
                 if let payload = dict["payload"] as? [String: Any], let deviceID = payload["deviceID"] as? String {
                     box.deviceID = deviceID
+                    if let name = payload["deviceName"] as? String, !name.isEmpty {
+                        let handler = self.onDeviceNamed
+                        DispatchQueue.main.async { handler?(deviceID, name) }
+                    }
                     // Tell the client which Mac this is so it can select/store the
                     // matching per-device key (enables one iPhone <-> many Macs).
                     self.sendLine(connection, jsonObject: [
                         "type": "server_info",
                         "payload": ["macID": self.machineID(), "macName": self.machineName()]
                     ])
+                    // QR pairing: if the hello carries a proof of the currently
+                    // displayed QR secret, pair without any approval dialog —
+                    // scanning the code on the Mac's own screen IS the approval.
+                    if let proofB64 = payload["qrProof"] as? String,
+                       let proof = Data(base64Encoded: proofB64),
+                       let qr = self.activeQRSecret, Date() < qr.expires {
+                        let expected = self.security.computeHMAC(secret: qr.secret, data: Data(deviceID.utf8))
+                        if expected == proof {
+                            let derived = self.security.deriveQRPairSecret(qrSecret: qr.secret, deviceID: deviceID)
+                            try? self.security.storeSharedSecret(derived, for: deviceID)
+                            self.activeQRSecret = nil  // one-time use
+                            box.authenticated = true
+                            self.sendLine(connection, jsonObject: ["type": "pair_qr_ok", "payload": [:]])
+                            self.onDeviceConnected(deviceID)
+                            let handler = self.onQRPaired
+                            DispatchQueue.main.async { handler?(deviceID) }
+                            print("[AirBridge] QR-paired device \(deviceID)")
+                            break
+                        } else {
+                            print("[AirBridge] QR proof mismatch from \(deviceID)")
+                        }
+                    }
                     // Attempt to load existing secret
                     if let _ = try? self.security.loadSharedSecret(for: deviceID) {
                         // Known device: require proof it holds the shared secret
@@ -454,6 +598,44 @@ final class NetworkManager {
                 if let payload = dict["payload"] as? [String: Any], let direction = payload["direction"] as? String {
                     try? self.eventInjector.handlePinch(zoomIn: direction.lowercased() == "in")
                 }
+            case "ping":
+                // Heartbeat: lets the client detect a half-dead connection
+                // (Mac asleep, Wi-Fi drop) instead of hanging silently.
+                self.sendLine(connection, jsonObject: ["type": "pong", "payload": [:]])
+            case "media":
+                #if os(macOS)
+                if let payload = dict["payload"] as? [String: Any], let action = payload["action"] as? String {
+                    try? self.eventInjector.handleMedia(action: action)
+                }
+                #endif
+            case "type_text":
+                // Types a whole string on the Mac (dictation, clipboard paste-through).
+                if let payload = dict["payload"] as? [String: Any], let text = payload["text"] as? String {
+                    try? self.eventInjector.typeText(text)
+                }
+            case "clipboard_set":
+                #if os(macOS)
+                if let payload = dict["payload"] as? [String: Any], let text = payload["text"] as? String {
+                    DispatchQueue.main.async {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(text, forType: .string)
+                    }
+                    self.emitActivity("doc.on.clipboard", "Clipboard received from iPhone")
+                }
+                #endif
+            case "clipboard_get":
+                #if os(macOS)
+                self.emitActivity("arrow.up.doc.on.clipboard", "Mac clipboard sent to iPhone")
+                DispatchQueue.main.async { [weak self] in
+                    let text = NSPasteboard.general.string(forType: .string) ?? ""
+                    self?.queue.async {
+                        self?.sendLine(connection, jsonObject: [
+                            "type": "clipboard_data",
+                            "payload": ["text": text]
+                        ])
+                    }
+                }
+                #endif
             case "pair_request":
                 // (Re-)pairing initiated by the client (e.g. it has no key for this
                 // Mac). Require explicit user approval, then store the new secret
@@ -936,6 +1118,7 @@ final class NetworkManager {
                 break
             }
         } catch {
+            let raw = String(data: lineData, encoding: .utf8) ?? "<non-utf8>"
             print("[AirBridge] Parse error: \(error.localizedDescription) line=\(raw)")
             sendError("parse_error: \(error.localizedDescription)", to: connection)
         }
