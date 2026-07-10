@@ -88,6 +88,11 @@ final class EventInjector {
 
     func clickMouse(kind: MouseClickKind) throws {
         print("[EventInjector] clickMouse kind=\(kind)")
+        // Defensive: a stale latched button (an up event lost to a hiccup)
+        // poisons every later click — e.g. a phantom held RIGHT button makes
+        // left clicks behave as right clicks/context menus. Clear the other
+        // buttons before clicking.
+        clearStaleButtons(except: kind)
         let pos = CGEvent(source: nil)?.location ?? .zero
         let button: CGMouseButton
         let downType: CGEventType
@@ -143,6 +148,33 @@ final class EventInjector {
         let modifierKeyCodes: [CGKeyCode] = [55, 58, 59, 56, 63] // Cmd, Opt, Ctrl, Shift, Fn
         for code in modifierKeyCodes {
             if let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) {
+                up.flags = []
+                up.post(tap: .cghidEventTap)
+            }
+        }
+        // Also release any latched mouse buttons — a lost mouse-up otherwise
+        // wedges the session (right-latch turns left clicks into right clicks;
+        // left-latch turns every move into a drag).
+        clearStaleButtons(except: nil)
+    }
+
+    /// Posts an "up" for any button macOS believes is currently held, except
+    /// the one being intentionally used.
+    func clearStaleButtons(except kind: MouseClickKind?) {
+        let pos = CGEvent(source: nil)?.location ?? .zero
+        let checks: [(MouseClickKind, CGMouseButton, CGEventType)] = [
+            (.left, .left, .leftMouseUp),
+            (.right, .right, .rightMouseUp),
+            (.middle, .center, .otherMouseUp)
+        ]
+        for (k, button, upType) in checks {
+            guard k != kind else { continue }
+            // A held LEFT button can be intentional (trackpad drag-lock), so
+            // only the disconnect path (kind == nil) clears it.
+            if k == .left && kind != nil { continue }
+            if CGEventSource.buttonState(.combinedSessionState, button: button),
+               let up = CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: pos, mouseButton: button) {
+                print("[EventInjector] clearing stale \(k) button")
                 up.flags = []
                 up.post(tap: .cghidEventTap)
             }
