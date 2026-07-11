@@ -260,6 +260,9 @@ final class NetworkManager {
     ]
     // Written on `queue` via setInputPaused; read on `queue` in handleLine.
     private var inputPaused = false
+    // Last known "focus is in a text field" state (queue-confined), so the
+    // phone is only notified on changes.
+    var lastTextFocusState = false
 
     /// Thread-safe toggle for suppressing input injection (menu bar / window).
     func setInputPaused(_ paused: Bool) {
@@ -510,6 +513,22 @@ final class NetworkManager {
                 if let payload = dict["payload"] as? [String: Any], let button = payload["button"] as? String {
                     let kind: MouseClickKind = (button == "right" ? .right : button == "middle" ? .middle : .left)
                     try? self.eventInjector.clickMouse(kind: kind)
+                    // After a left click, check whether a text field took focus
+                    // so the phone can raise its keyboard automatically.
+                    if kind == .left { self.checkTextFieldFocus(after: 0.25, connection: connection) }
+                }
+            case "key_combo":
+                // A key with explicit modifiers (keyboard accessory bar shortcuts).
+                if let payload = dict["payload"] as? [String: Any] {
+                    let keyCode = (payload["keyCode"] as? Int) ?? Int(payload["keyCode"] as? Double ?? -1)
+                    if keyCode >= 0 {
+                        try? self.eventInjector.pressKeyCombo(
+                            CGKeyCode(keyCode),
+                            command: payload["command"] as? Bool ?? false,
+                            option: payload["option"] as? Bool ?? false,
+                            control: payload["control"] as? Bool ?? false,
+                            shift: payload["shift"] as? Bool ?? false)
+                    }
                 }
             case "mouse_move_abs":
                 // Absolute, display-normalized cursor position (Live Screen touch).
@@ -693,6 +712,17 @@ final class NetworkManager {
                     else if let maxWD = payload["maxWidth"] as? Double { self.videoMaxWidth = Int(maxWD) }
                     if let q = payload["quality"] as? Double { self.videoQuality = max(0.1, min(1.0, q)) }
                 }
+                #if os(macOS)
+                // Without Screen Recording permission, capture fails silently and
+                // the phone shows "no frames" forever. Tell it why.
+                if !CGPreflightScreenCaptureAccess() {
+                    _ = CGRequestScreenCaptureAccess()  // prompts / adds AirBridge to the list once
+                    self.sendLine(connection, jsonObject: [
+                        "type": "stream_error",
+                        "payload": ["reason": "screen_recording_permission"]
+                    ])
+                }
+                #endif
                 self.startVideoStream(to: connection)
             case "video_stop":
                 self.stopVideoStream()
@@ -1383,6 +1413,46 @@ private extension NetworkManager {
             print("[NetworkManager] Mission Control launch failed (\(error)); falling back to Ctrl+Arrow")
             try? eventInjector.handleSwipe(fingers: fallbackFingers, direction: appExpose ? "down" : "up")
         }
+    }
+
+    /// After a click, checks (via Accessibility) whether keyboard focus landed
+    /// on a text field and notifies the phone on CHANGES so it can raise or
+    /// lower its keyboard automatically.
+    func checkTextFieldFocus(after delay: TimeInterval, connection: NWConnection) {
+        queue.asyncAfter(deadline: .now() + delay) { [weak self, weak connection] in
+            guard let self, let connection else { return }
+            let focused = Self.focusedElementIsTextInput()
+            if focused != self.lastTextFocusState {
+                self.lastTextFocusState = focused
+                self.sendLine(connection, jsonObject: [
+                    "type": "text_focus",
+                    "payload": ["focused": focused]
+                ])
+            }
+        }
+    }
+
+    private static func focusedElementIsTextInput() -> Bool {
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
+              let focusedRaw = focusedRef, CFGetTypeID(focusedRaw) == AXUIElementGetTypeID() else { return false }
+        let element = unsafeDowncast(focusedRaw as AnyObject, to: AXUIElement.self)
+        var roleRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success,
+              let role = roleRef as? String else { return false }
+        if role == kAXTextFieldRole as String || role == kAXTextAreaRole as String || role == kAXComboBoxRole as String {
+            return true
+        }
+        // Web content (browsers) often exposes editable areas as AXWebArea/other
+        // roles but sets the focused element's AXRoleDescription or supports
+        // AXSelectedText editing; a pragmatic extra check:
+        var editableRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, "AXEditableAncestor" as CFString, &editableRef) == .success,
+           editableRef != nil {
+            return true
+        }
+        return false
     }
 
     /// Runs an AppleScript snippet; MUST be called on the main thread.

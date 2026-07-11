@@ -212,15 +212,24 @@ final class AppState: ObservableObject {
     // MARK: - Accessibility polling (live onboarding checklist)
 
     @Published var accessibilityOK = AXIsProcessTrusted()
+    @Published var screenRecordingOK = CGPreflightScreenCaptureAccess()
     private var axTimer: Timer?
 
     private func startAccessibilityPolling() {
         axTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
-                let ok = AXIsProcessTrusted()
-                if ok != self.accessibilityOK { self.accessibilityOK = ok }
+                let ax = AXIsProcessTrusted()
+                if ax != self.accessibilityOK { self.accessibilityOK = ax }
+                let sr = CGPreflightScreenCaptureAccess()
+                if sr != self.screenRecordingOK { self.screenRecordingOK = sr }
             }
+        }
+    }
+
+    func openScreenRecordingSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
         }
     }
 

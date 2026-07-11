@@ -350,6 +350,24 @@ extension EventInjector {
         try pressCommandKey(zoomIn ? 24 : 27)  // = / -
     }
 
+    /// Presses a key with an explicit modifier combination (flags set on the
+    /// events themselves — reliable, unlike separately posted modifier keys).
+    func pressKeyCombo(_ keyCode: CGKeyCode, command: Bool, option: Bool, control: Bool, shift: Bool) throws {
+        var flags: CGEventFlags = []
+        if command { flags.insert(.maskCommand) }
+        if option { flags.insert(.maskAlternate) }
+        if control { flags.insert(.maskControl) }
+        if shift { flags.insert(.maskShift) }
+        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true),
+              let up = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else {
+            throw InjectError.eventCreateFailed
+        }
+        down.flags = flags
+        up.flags = flags
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+    }
+
     private func pressCommandKey(_ keyCode: CGKeyCode) throws {
         print("[EventInjector] pressCommandKey keyCode=\(keyCode)")
         let commandFlag: CGEventFlags = .maskCommand
