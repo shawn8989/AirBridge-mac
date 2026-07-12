@@ -106,8 +106,8 @@ final class EventInjector {
         move.post(tap: .cghidEventTap)
     }
 
-    func clickMouse(kind: MouseClickKind) throws {
-        print("[EventInjector] clickMouse kind=\(kind)")
+    func clickMouse(kind: MouseClickKind, count: Int = 1) throws {
+        print("[EventInjector] clickMouse kind=\(kind) count=\(count)")
         // Defensive: a stale latched button (an up event lost to a hiccup)
         // poisons every later click — e.g. a phantom held RIGHT button makes
         // left clicks behave as right clicks/context menus. Clear the other
@@ -125,18 +125,23 @@ final class EventInjector {
         case .middle:
             button = .center; downType = .otherMouseDown; upType = .otherMouseUp
         }
-        guard let down = CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: pos, mouseButton: button),
-              let up = CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: pos, mouseButton: button) else { throw InjectError.eventCreateFailed }
-        // Clear modifier flags explicitly: a latched synthetic Ctrl (from the
-        // keyboard's modifier toggles or an interrupted chord) otherwise rides
-        // along and macOS treats Ctrl+LeftClick as a RIGHT click (context menu).
-        down.flags = []
-        up.flags = []
-        // Proper single-click semantics; some apps ignore clicks without it.
-        down.setIntegerValueField(.mouseEventClickState, value: 1)
-        up.setIntegerValueField(.mouseEventClickState, value: 1)
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
+        // Multi-clicks are signalled through mouseEventClickState, not by
+        // repeating single clicks — two clickState=1 clicks never register as
+        // a double-click, so Touch mode couldn't open files without this.
+        let clicks = max(1, min(count, 3))
+        for state in 1...clicks {
+            guard let down = CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: pos, mouseButton: button),
+                  let up = CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: pos, mouseButton: button) else { throw InjectError.eventCreateFailed }
+            // Clear modifier flags explicitly: a latched synthetic Ctrl (from the
+            // keyboard's modifier toggles or an interrupted chord) otherwise rides
+            // along and macOS treats Ctrl+LeftClick as a RIGHT click (context menu).
+            down.flags = []
+            up.flags = []
+            down.setIntegerValueField(.mouseEventClickState, value: Int64(state))
+            up.setIntegerValueField(.mouseEventClickState, value: Int64(state))
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+        }
     }
 
     func scroll(dx: Double, dy: Double) throws {

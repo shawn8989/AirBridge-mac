@@ -104,6 +104,7 @@ final class NetworkManager {
 
     // Video streaming state
     private var videoTimer: DispatchSourceTimer?
+    private var focusPollTimer: DispatchSourceTimer?
     private var videoMaxWidth: Int = 800
     private var videoQuality: Double = 0.6
     private var isSendingFrame = false
@@ -512,7 +513,8 @@ final class NetworkManager {
                 // Convenience that performs down+up using eventInjector.clickMouse(kind:)
                 if let payload = dict["payload"] as? [String: Any], let button = payload["button"] as? String {
                     let kind: MouseClickKind = (button == "right" ? .right : button == "middle" ? .middle : .left)
-                    try? self.eventInjector.clickMouse(kind: kind)
+                    let count = (payload["count"] as? Int) ?? Int(payload["count"] as? Double ?? 1)
+                    try? self.eventInjector.clickMouse(kind: kind, count: count)
                     // After a left click, check whether a text field took focus
                     // so the phone can raise its keyboard automatically.
                     if kind == .left { self.checkTextFieldFocus(after: 0.25, connection: connection) }
@@ -1230,11 +1232,33 @@ final class NetworkManager {
         }
         timer.resume()
         self.videoTimer = timer
+
+        // While the phone is watching the screen, poll keyboard focus so its
+        // keyboard rises even when focus changed without a phone click (Tab
+        // key, Spotlight, a dialog opening, the real mouse...). Click-driven
+        // detection alone misses all of those.
+        let focusTimer = DispatchSource.makeTimerSource(queue: queue)
+        focusTimer.schedule(deadline: .now() + 1, repeating: .seconds(1), leeway: .milliseconds(200))
+        focusTimer.setEventHandler { [weak self, weak connection] in
+            guard let self, let connection else { return }
+            let focused = Self.focusedElementIsTextInput()
+            if focused != self.lastTextFocusState {
+                self.lastTextFocusState = focused
+                self.sendLine(connection, jsonObject: [
+                    "type": "text_focus",
+                    "payload": ["focused": focused]
+                ])
+            }
+        }
+        focusTimer.resume()
+        self.focusPollTimer = focusTimer
     }
 
     private func stopVideoStream() {
         videoTimer?.cancel()
         videoTimer = nil
+        focusPollTimer?.cancel()
+        focusPollTimer = nil
         isSendingFrame = false
         #if os(macOS)
         screenCapture?.stop()
