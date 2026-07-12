@@ -257,7 +257,7 @@ final class NetworkManager {
     // Message types suppressed by "Pause Input".
     private static let inputTypes: Set<String> = [
         "mouse_move", "mouse_move_abs", "scroll", "mouse_click", "mouse_down", "mouse_up",
-        "key_down", "key_up", "swipe", "action", "nav", "pinch", "media", "type_text"
+        "key_down", "key_up", "key_combo", "swipe", "action", "nav", "pinch", "media", "type_text"
     ]
     // Written on `queue` via setInputPaused; read on `queue` in handleLine.
     private var inputPaused = false
@@ -1018,6 +1018,25 @@ final class NetworkManager {
                 self.sendError("request_desktops not supported on this platform", to: connection)
                 #endif
 
+            case "request_desktop_previews":
+                #if os(macOS)
+                let previewWidth: Int = {
+                    if let p = dict["payload"] as? [String: Any] {
+                        if let v = p["maxWidth"] as? Int { return v }
+                        if let v = p["maxWidth"] as? Double { return Int(v) }
+                    }
+                    return 280
+                }()
+                if CGPreflightScreenCaptureAccess() {
+                    Task.detached { [weak self, weak connection] in
+                        guard let self, let connection else { return }
+                        await self._sendDesktopPreviews(to: connection, maxWidth: previewWidth)
+                    }
+                } else {
+                    self.sendError("desktop_previews: screen recording permission missing", to: connection)
+                }
+                #endif
+
             case "focus_desktop":
                 #if os(macOS)
                 if let payload = dict["payload"] as? [String: Any], let id = payload["id"] as? String {
@@ -1638,6 +1657,84 @@ private extension NetworkManager {
             }
         }
         return mapping
+    }
+
+    /// Composites a miniature of every desktop from per-window screenshots and
+    /// streams them to the phone as individual "desktop_preview" messages.
+    /// SCContentFilter(desktopIndependentWindow:) can image a window no matter
+    /// which Space it lives on — the only way to preview non-current desktops.
+    func _sendDesktopPreviews(to connection: NWConnection, maxWidth: Int) async {
+        guard let desktops = try? _enumerateDesktops(), !desktops.isEmpty,
+              let winInfo = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else { return }
+        let spaceMap = _buildWindowToSpaceIndexMap()
+        guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false) else { return }
+        let scByID = Dictionary(content.windows.map { (Int($0.windowID), $0) },
+                                uniquingKeysWith: { a, _ in a })
+
+        let screen = NSScreen.main?.frame ?? CGRect(x: 0, y: 0, width: 1728, height: 1117)
+        guard screen.width > 0 else { return }
+        let scale = CGFloat(maxWidth) / screen.width
+        let canvasW = maxWidth
+        let canvasH = max(1, Int(screen.height * scale))
+
+        struct Entry { let id: Int; let bounds: CGRect; let space: Int }
+        var entries: [Entry] = []
+        for w in winInfo {
+            guard (w[kCGWindowLayer as String] as? Int ?? 0) == 0,
+                  let num = w[kCGWindowNumber as String] as? Int,
+                  let space = spaceMap[num],
+                  let bDict = w[kCGWindowBounds as String] as? NSDictionary,
+                  let b = CGRect(dictionaryRepresentation: bDict),
+                  b.width > 40, b.height > 40 else { continue }
+            entries.append(Entry(id: num, bounds: b, space: space))
+        }
+
+        var captureCache: [Int: CGImage] = [:]
+        var capturesLeft = 24  // total screenshot budget per refresh
+
+        for d in desktops {
+            guard let idx = d["index"] as? Int, let id = d["id"] as? String else { continue }
+            // CGWindowList is front-to-back; keep the frontmost few, draw reversed.
+            let wins = Array(entries.filter { $0.space == idx }.prefix(8))
+            guard let ctx = CGContext(data: nil, width: canvasW, height: canvasH,
+                                      bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue) else { continue }
+            ctx.setFillColor(CGColor(red: 0.13, green: 0.14, blue: 0.18, alpha: 1))
+            ctx.fill(CGRect(x: 0, y: 0, width: CGFloat(canvasW), height: CGFloat(canvasH)))
+
+            for e in wins.reversed() {
+                var img = captureCache[e.id]
+                if img == nil, capturesLeft > 0, let sc = scByID[e.id] {
+                    capturesLeft -= 1
+                    let cfg = SCStreamConfiguration()
+                    cfg.width = max(2, Int(e.bounds.width * scale * 2))   // 2x for crispness
+                    cfg.height = max(2, Int(e.bounds.height * scale * 2))
+                    cfg.showsCursor = false
+                    let filter = SCContentFilter(desktopIndependentWindow: sc)
+                    img = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
+                    if let captured = img { captureCache[e.id] = captured }
+                }
+                // CGWindow bounds are top-left origin; CGContext is bottom-left.
+                let r = CGRect(x: e.bounds.minX * scale,
+                               y: CGFloat(canvasH) - e.bounds.maxY * scale,
+                               width: e.bounds.width * scale,
+                               height: e.bounds.height * scale)
+                if let img {
+                    ctx.draw(img, in: r)
+                } else {
+                    ctx.setFillColor(CGColor(gray: 0.32, alpha: 1))
+                    ctx.fill(r)
+                }
+            }
+
+            guard let composed = ctx.makeImage(),
+                  let jpeg = self.jpegData(from: composed, maxWidth: maxWidth, quality: 0.7) else { continue }
+            self.sendLine(connection, jsonObject: [
+                "type": "desktop_preview",
+                "payload": ["id": id, "data": jpeg.base64EncodedString()]
+            ])
+        }
     }
 
     func _windowImage(windowNumber: Int) -> CGImage? {

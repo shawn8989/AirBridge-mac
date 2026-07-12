@@ -443,6 +443,11 @@ extension EventInjector {
             }
             down.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
             up.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+            // A latched synthetic modifier (lost key_up) otherwise rides along
+            // and silently turns every typed character into a ⌘/⌃ shortcut —
+            // "the keyboard types nothing" while special keys still work.
+            down.flags = []
+            up.flags = []
             down.post(tap: .cghidEventTap)
             up.post(tap: .cghidEventTap)
             i += chunkSize
