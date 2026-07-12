@@ -516,8 +516,12 @@ final class NetworkManager {
                     let count = (payload["count"] as? Int) ?? Int(payload["count"] as? Double ?? 1)
                     try? self.eventInjector.clickMouse(kind: kind, count: count)
                     // After a left click, check whether a text field took focus
-                    // so the phone can raise its keyboard automatically.
-                    if kind == .left { self.checkTextFieldFocus(after: 0.25, connection: connection) }
+                    // so the phone can raise its keyboard automatically. Twice:
+                    // browsers/electron apps update AX focus noticeably late.
+                    if kind == .left {
+                        self.checkTextFieldFocus(after: 0.25, connection: connection)
+                        self.checkTextFieldFocus(after: 1.0, connection: connection)
+                    }
                 }
             case "key_combo":
                 // A key with explicit modifiers (keyboard accessory bar shortcuts).
@@ -1484,15 +1488,36 @@ private extension NetworkManager {
         var roleRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success,
               let role = roleRef as? String else { return false }
-        if role == kAXTextFieldRole as String || role == kAXTextAreaRole as String || role == kAXComboBoxRole as String {
+        let textRoles: Set<String> = [
+            kAXTextFieldRole as String, kAXTextAreaRole as String,
+            kAXComboBoxRole as String, "AXSearchField", "AXSecureTextField"
+        ]
+        if textRoles.contains(role) { return true }
+
+        // Subrole catches search/secure fields exposed under a generic role.
+        var subroleRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &subroleRef) == .success,
+           let subrole = subroleRef as? String,
+           ["AXSearchField", "AXSecureTextField", "AXTextInput"].contains(subrole) {
             return true
         }
+
         // Web content (browsers) often exposes editable areas as AXWebArea/other
         // roles but sets the focused element's AXRoleDescription or supports
         // AXSelectedText editing; a pragmatic extra check:
         var editableRef: CFTypeRef?
         if AXUIElementCopyAttributeValue(element, "AXEditableAncestor" as CFString, &editableRef) == .success,
            editableRef != nil {
+            return true
+        }
+
+        // Last resort for web/electron apps: a focused element whose VALUE is
+        // settable is a text input in practice (buttons/links aren't settable).
+        var settable = DarwinBoolean(false)
+        if AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success,
+           settable.boolValue,
+           role != "AXCheckBox", role != "AXRadioButton", role != "AXSlider",
+           role != "AXPopUpButton", role != "AXMenuItem", role != "AXIncrementor" {
             return true
         }
         return false
