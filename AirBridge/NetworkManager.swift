@@ -222,7 +222,16 @@ final class NetworkManager {
         params.includePeerToPeer = false
 
         do {
-            let listener = try NWListener(using: params, on: 0)
+            // Fixed port first so "connect by address" (VPN/Tailscale use) has
+            // a stable target across relaunches; fall back to ephemeral if the
+            // port is taken. Bonjour discovery works either way.
+            let listener: NWListener
+            if let port = NWEndpoint.Port(rawValue: 52417),
+               let fixed = try? NWListener(using: params, on: port) {
+                listener = fixed
+            } else {
+                listener = try NWListener(using: params, on: 0)
+            }
             self.listener = listener
             listener.service = NWListener.Service(name: self.machineName(), type: "_airbridge._tcp")
             listener.stateUpdateHandler = { [weak self] state in
