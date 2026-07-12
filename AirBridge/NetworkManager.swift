@@ -17,6 +17,7 @@ import VideoToolbox
 import CoreServices
 import AppKit
 import Darwin
+import IOKit.pwr_mgt
 #endif
 
 private final class ConnectionBox {
@@ -143,6 +144,51 @@ final class NetworkManager {
         }
         NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
     }
+    #endif
+
+    #if os(macOS)
+    // Display wake: remote input declares user activity so a dark/asleep
+    // display lights up, exactly like touching the physical mouse. Throttled.
+    private var lastUserActivityDeclared: CFAbsoluteTime = 0
+    private var userActivityAssertionID: IOPMAssertionID = 0
+    private func declareUserActivityIfNeeded() {
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastUserActivityDeclared > 5 else { return }
+        lastUserActivityDeclared = now
+        IOPMAssertionDeclareUserActivity("AirPad remote input" as CFString,
+                                         kIOPMUserActiveLocal,
+                                         &userActivityAssertionID)
+    }
+
+    /// MAC address of the primary Ethernet/Wi-Fi interface (en0 preferred),
+    /// shared with the phone for Wake-on-LAN.
+    static func primaryMACAddress() -> String? {
+        var addrs: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&addrs) == 0 else { return nil }
+        defer { freeifaddrs(addrs) }
+        var candidate: String?
+        var ptr = addrs
+        while let p = ptr {
+            let ifa = p.pointee
+            ptr = ifa.ifa_next
+            guard let sa = ifa.ifa_addr, sa.pointee.sa_family == UInt8(AF_LINK) else { continue }
+            let name = String(cString: ifa.ifa_name)
+            let sdl = UnsafeRawPointer(sa).assumingMemoryBound(to: sockaddr_dl.self).pointee
+            guard sdl.sdl_alen == 6 else { continue }
+            let mac: String? = withUnsafeBytes(of: sdl.sdl_data) { raw -> String? in
+                let start = Int(sdl.sdl_nlen)
+                guard raw.count >= start + 6 else { return nil }
+                return (0..<6).map { String(format: "%02x", raw[start + $0]) }
+                    .joined(separator: ":")
+            }
+            guard let mac, mac != "00:00:00:00:00:00" else { continue }
+            if name == "en0" { return mac }
+            if candidate == nil, name.hasPrefix("en") { candidate = mac }
+        }
+        return candidate
+    }
+    #else
+    private func declareUserActivityIfNeeded() {}
     #endif
 
     // Stable per-Mac identifier so the iPhone can key its per-Mac secret.
@@ -380,6 +426,9 @@ final class NetworkManager {
             if Self.inputTypes.contains(type) {
                 eventsInWindow += 1
                 if let id = box.deviceID { perDeviceTotals[id, default: 0] += 1 }
+                // Remote input counts as user activity: wakes a sleeping
+                // display exactly like touching the physical mouse would.
+                self.declareUserActivityIfNeeded()
             }
             switch type {
             case "hello":
@@ -391,9 +440,16 @@ final class NetworkManager {
                     }
                     // Tell the client which Mac this is so it can select/store the
                     // matching per-device key (enables one iPhone <-> many Macs).
+                    self.lastTextFocusState = false  // fresh connection, fresh focus tracking
+                    var serverInfo: [String: Any] = ["macID": self.machineID(), "macName": self.machineName()]
+                    #if os(macOS)
+                    // Hardware address lets the phone send Wake-on-LAN packets
+                    // when this Mac is asleep (needs "Wake for network access").
+                    if let mac = Self.primaryMACAddress() { serverInfo["macAddress"] = mac }
+                    #endif
                     self.sendLine(connection, jsonObject: [
                         "type": "server_info",
-                        "payload": ["macID": self.machineID(), "macName": self.machineName()]
+                        "payload": serverInfo
                     ])
                     // QR pairing: if the hello carries a proof of the currently
                     // displayed QR secret, pair without any approval dialog —
@@ -1222,6 +1278,10 @@ final class NetworkManager {
 
     private func startVideoStream(to connection: NWConnection) {
         stopVideoStream()
+        // Re-announce keyboard focus from scratch on every new stream: a stale
+        // "already focused" state otherwise suppresses the text_focus event the
+        // phone needs to auto-raise its keyboard.
+        lastTextFocusState = false
         #if os(macOS)
         if screenCapture == nil {
             let helper = ScreenCaptureHelper()
@@ -1702,7 +1762,7 @@ private extension NetworkManager {
         let canvasW = maxWidth
         let canvasH = max(1, Int(screen.height * scale))
 
-        struct Entry { let id: Int; let bounds: CGRect; let space: Int }
+        struct Entry { let id: Int; let bounds: CGRect; let space: Int; let app: String }
         var entries: [Entry] = []
         for w in winInfo {
             guard (w[kCGWindowLayer as String] as? Int ?? 0) == 0,
@@ -1711,8 +1771,17 @@ private extension NetworkManager {
                   let bDict = w[kCGWindowBounds as String] as? NSDictionary,
                   let b = CGRect(dictionaryRepresentation: bDict),
                   b.width > 40, b.height > 40 else { continue }
-            entries.append(Entry(id: num, bounds: b, space: space))
+            let app = w[kCGWindowOwnerName as String] as? String ?? "?"
+            entries.append(Entry(id: num, bounds: b, space: space, app: app))
         }
+
+        // The CURRENT desktop gets a real full-screen shot — the same capture
+        // path the live stream uses, which is known-good. Per-window captures
+        // (needed for other Spaces) are unreliable for off-Space windows on
+        // recent macOS and often come back black; those get validated and fall
+        // back to colored window silhouettes so a preview is never just black.
+        let currentIdx = _currentDesktopIndex(from: desktops)
+        let fullShot = _captureDisplayOnce()
 
         var captureCache: [Int: CGImage] = [:]
         var capturesLeft = 24  // total screenshot budget per refresh
@@ -1725,31 +1794,37 @@ private extension NetworkManager {
                                       bitsPerComponent: 8, bytesPerRow: 0,
                                       space: CGColorSpaceCreateDeviceRGB(),
                                       bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue) else { continue }
-            ctx.setFillColor(CGColor(red: 0.13, green: 0.14, blue: 0.18, alpha: 1))
+            ctx.setFillColor(CGColor(red: 0.17, green: 0.18, blue: 0.23, alpha: 1))
             ctx.fill(CGRect(x: 0, y: 0, width: CGFloat(canvasW), height: CGFloat(canvasH)))
 
-            for e in wins.reversed() {
-                var img = captureCache[e.id]
-                if img == nil, capturesLeft > 0, let sc = scByID[e.id] {
-                    capturesLeft -= 1
-                    let cfg = SCStreamConfiguration()
-                    cfg.width = max(2, Int(e.bounds.width * scale * 2))   // 2x for crispness
-                    cfg.height = max(2, Int(e.bounds.height * scale * 2))
-                    cfg.showsCursor = false
-                    let filter = SCContentFilter(desktopIndependentWindow: sc)
-                    img = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
-                    if let captured = img { captureCache[e.id] = captured }
-                }
-                // CGWindow bounds are top-left origin; CGContext is bottom-left.
-                let r = CGRect(x: e.bounds.minX * scale,
-                               y: CGFloat(canvasH) - e.bounds.maxY * scale,
-                               width: e.bounds.width * scale,
-                               height: e.bounds.height * scale)
-                if let img {
-                    ctx.draw(img, in: r)
-                } else {
-                    ctx.setFillColor(CGColor(gray: 0.32, alpha: 1))
-                    ctx.fill(r)
+            if idx == currentIdx, let shot = fullShot {
+                ctx.draw(shot, in: CGRect(x: 0, y: 0, width: CGFloat(canvasW), height: CGFloat(canvasH)))
+            } else {
+                for e in wins.reversed() {
+                    var img = captureCache[e.id]
+                    if img == nil, capturesLeft > 0, let sc = scByID[e.id] {
+                        capturesLeft -= 1
+                        let cfg = SCStreamConfiguration()
+                        cfg.width = max(2, Int(e.bounds.width * scale * 2))   // 2x for crispness
+                        cfg.height = max(2, Int(e.bounds.height * scale * 2))
+                        cfg.showsCursor = false
+                        let filter = SCContentFilter(desktopIndependentWindow: sc)
+                        if let captured = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg),
+                           !Self._isMostlyBlack(captured) {
+                            img = captured
+                            captureCache[e.id] = captured
+                        }
+                    }
+                    // CGWindow bounds are top-left origin; CGContext is bottom-left.
+                    let r = CGRect(x: e.bounds.minX * scale,
+                                   y: CGFloat(canvasH) - e.bounds.maxY * scale,
+                                   width: e.bounds.width * scale,
+                                   height: e.bounds.height * scale)
+                    if let img {
+                        ctx.draw(img, in: r)
+                    } else {
+                        Self._drawWindowSilhouette(ctx, rect: r, appName: e.app)
+                    }
                 }
             }
 
@@ -1760,6 +1835,69 @@ private extension NetworkManager {
                 "payload": ["id": id, "data": jpeg.base64EncodedString()]
             ])
         }
+    }
+
+    /// One frame of the main display: the live stream's latest frame when
+    /// streaming, else a one-shot ScreenCaptureKit capture (≤1s).
+    private func _captureDisplayOnce() -> CGImage? {
+        if let live = latestCapturedImage { return live }
+
+        final class OneShotConsumer: ScreenFrameConsumer {
+            let sema: DispatchSemaphore
+            var image: CGImage?
+            init(sema: DispatchSemaphore) { self.sema = sema }
+            func didProduceFrame(_ image: CGImage) {
+                if self.image == nil { self.image = image; sema.signal() }
+            }
+        }
+        let sema = DispatchSemaphore(value: 0)
+        let helper = ScreenCaptureHelper()
+        let consumer = OneShotConsumer(sema: sema)
+        helper.consumer = consumer
+        Task {
+            do { try await helper.start() } catch { sema.signal() }
+        }
+        let waitResult = sema.wait(timeout: .now() + 1.0)
+        helper.stop()
+        guard waitResult == .success else { return nil }
+        return consumer.image
+    }
+
+    /// True when an image is essentially black (failed off-Space capture).
+    private static func _isMostlyBlack(_ image: CGImage) -> Bool {
+        let w = 8, h = 8
+        guard let ctx = CGContext(data: nil, width: w, height: h,
+                                  bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        guard let data = ctx.data else { return false }
+        let buf = data.bindMemory(to: UInt8.self, capacity: w * h * 4)
+        var total = 0
+        for i in 0..<(w * h) {
+            total += Int(buf[i * 4]) + Int(buf[i * 4 + 1]) + Int(buf[i * 4 + 2])
+        }
+        return total < (w * h * 3) * 10  // average channel value under 10/255
+    }
+
+    /// Mission-Control-style stand-in when a window can't be imaged: a rounded
+    /// card tinted per app, with a title-bar strip. Stable color per app name.
+    private static func _drawWindowSilhouette(_ ctx: CGContext, rect: CGRect, appName: String) {
+        let hash = appName.unicodeScalars.reduce(0) { ($0 &* 31 &+ Int($1.value)) & 0x7FFFFFFF }
+        let hue = CGFloat(hash % 360) / 360
+        let color = NSColor(hue: hue, saturation: 0.42, brightness: 0.58, alpha: 1)
+        let path = CGPath(roundedRect: rect, cornerWidth: 3, cornerHeight: 3, transform: nil)
+        ctx.setFillColor(color.cgColor)
+        ctx.addPath(path)
+        ctx.fillPath()
+        // Title-bar strip along the window's top edge (context is bottom-left).
+        let bar = CGRect(x: rect.minX, y: max(rect.minY, rect.maxY - 4), width: rect.width, height: 4)
+        ctx.setFillColor(CGColor(gray: 1, alpha: 0.3))
+        ctx.fill(bar)
+        ctx.setStrokeColor(CGColor(gray: 1, alpha: 0.35))
+        ctx.setLineWidth(1)
+        ctx.addPath(path)
+        ctx.strokePath()
     }
 
     func _windowImage(windowNumber: Int) -> CGImage? {
