@@ -213,9 +213,37 @@ final class NetworkManager {
         }
     }
 
+    /// Tears down and recreates the listener. The Bonjour registration dies
+    /// silently across system sleep — the listener still reports .ready and
+    /// the dashboard says "advertising", but phones can't see the Mac until
+    /// the service is re-registered.
+    func restartAdvertising() {
+        queue.async { [weak self] in
+            guard let self, self.listener != nil else { return }
+            print("[AirBridge] Re-registering Bonjour service")
+            self.listener?.cancel()
+            self.listener = nil
+            for (_, connection) in self.activeConnections { connection.cancel() }
+            self._start()  // metric/reaper timers are recreate-safe
+        }
+    }
+
+    private var wakeObserverInstalled = false
+
     private func _start() {
         startMetricsTimer()
         startConnectionReaper()
+        #if os(macOS)
+        if !wakeObserverInstalled {
+            wakeObserverInstalled = true
+            // Re-advertise after every wake — the #1 cause of "AirBridge says
+            // advertising but the phone can't find the Mac".
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didWakeNotification, object: nil, queue: nil) { [weak self] _ in
+                self?.restartAdvertising()
+            }
+        }
+        #endif
         // Shared-key TLS-PSK listener (known-working transport). The server-side
         // per-device PSK *selection block* did not complete the TLS handshake in
         // practice, so the channel uses one shared key for encryption and we
@@ -244,7 +272,12 @@ final class NetworkManager {
                     print("[AirBridge] Bonjour advertising _airbridge._tcp and listening")
                     print("[AirBridge] Listener ready on port: \(String(describing: self?.listener?.port))")
                 case .failed(let error):
-                    print("Listener failed: \(error)")
+                    // A failed listener means we're invisible while the UI
+                    // still says "advertising" — recreate it.
+                    print("Listener failed: \(error) — restarting in 2s")
+                    self?.queue.asyncAfter(deadline: .now() + 2) {
+                        self?.restartAdvertising()
+                    }
                 default: break
                 }
             }
