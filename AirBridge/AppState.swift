@@ -116,6 +116,16 @@ final class AppState: ObservableObject {
         }
         updateChecker.check()
         Task { await networkManager.start() }
+
+        // If we quit with a synthetic modifier or mouse button still held,
+        // it stays latched in the window server and the user's PHYSICAL
+        // keyboard/mouse misbehave until reboot. Always release on exit.
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.networkManager.emergencyReleaseInput()
+            // Give the async release a beat to post before the process dies.
+            Thread.sleep(forTimeInterval: 0.15)
+        }
     }
 
     private var updateCancellable: AnyCancellable?

@@ -24,6 +24,9 @@ private final class ConnectionBox {
     var buffer = Data()
     var pendingSecret: Data
     var deviceID: String?   // Added property for deviceID
+    // Last inbound activity; the reaper cancels connections that go silent
+    // (clients heartbeat every 15s, so >40s means the peer is gone).
+    var lastRXAt: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()
     var scrollAccumX: Double = 0
     var scrollAccumY: Double = 0
     // App-layer authentication state. Commands are only executed once the
@@ -212,6 +215,7 @@ final class NetworkManager {
 
     private func _start() {
         startMetricsTimer()
+        startConnectionReaper()
         // Shared-key TLS-PSK listener (known-working transport). The server-side
         // per-device PSK *selection block* did not complete the TLS handshake in
         // practice, so the channel uses one shared key for encryption and we
@@ -267,11 +271,63 @@ final class NetworkManager {
         print("[AirBridge] Accepted connection: \(connection)")
         // Removed: initial pair_response send on accept per instructions.
 
-        connection.stateUpdateHandler = { state in
-            if case .failed(let error) = state { print("Conn failed: \(error)") }
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let self, let connection else { return }
+            switch state {
+            case .failed(let error):
+                self.teardown(connection, reason: "failed: \(error)")
+            case .cancelled:
+                self.teardown(connection, reason: "cancelled")
+            default:
+                break
+            }
         }
         connection.start(queue: queue)
         receive(on: connection)
+    }
+
+    /// Single, idempotent connection teardown. EVERY exit path must land here:
+    /// a missed teardown leaves the dashboard saying "connected" and — far
+    /// worse — leaves synthetic modifiers/buttons latched, wedging the user's
+    /// physical keyboard and mouse. Runs on `queue`.
+    private func teardown(_ connection: NWConnection, reason: String) {
+        let key = ObjectIdentifier(connection)
+        defer { connection.cancel() }
+        guard let box = connectionBoxes[key] else { return }  // already torn down
+        let deviceID = box.deviceID
+        connectionBoxes.removeValue(forKey: key)
+        activeConnections.removeValue(forKey: key)
+        print("[AirBridge] Connection closed (\(reason))")
+        eventInjector.releaseAllModifiers()
+        stopVideoStream()
+        onDeviceDisconnected(deviceID)
+    }
+
+    /// Releases every synthetic modifier and mouse button — called when the
+    /// app quits so nothing stays latched in the window server after us.
+    func emergencyReleaseInput() {
+        queue.async { [weak self] in self?.eventInjector.releaseAllModifiers() }
+    }
+
+    // Reaps half-open connections: a phone that vanished (Wi-Fi drop, app
+    // killed) never sends a FIN, so without this the dashboard says
+    // "connected" forever and latched input is never released.
+    private var reaperTimer: DispatchSourceTimer?
+    private func startConnectionReaper() {
+        reaperTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 10, repeating: .seconds(10), leeway: .seconds(2))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let now = CFAbsoluteTimeGetCurrent()
+            for (key, connection) in self.activeConnections {
+                if let box = self.connectionBoxes[key], now - box.lastRXAt > 40 {
+                    self.teardown(connection, reason: "inactivity (\(Int(now - box.lastRXAt))s)")
+                }
+            }
+        }
+        timer.resume()
+        reaperTimer = timer
     }
 
     private func receive(on connection: NWConnection) {
@@ -280,6 +336,7 @@ final class NetworkManager {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
             guard let self else { return }
             if let data, !data.isEmpty {
+                box.lastRXAt = CFAbsoluteTimeGetCurrent()
                 box.buffer.append(data)
                 // Process complete lines (\n-delimited)
                 while let newlineIndex = box.buffer.firstIndex(of: 0x0A) { // 0x0A = \n
@@ -290,15 +347,7 @@ final class NetworkManager {
                 }
             }
             if isComplete || error != nil {
-                let deviceID = box.deviceID
-                self.connectionBoxes.removeValue(forKey: key)
-                self.activeConnections.removeValue(forKey: key)
-                self.onDeviceDisconnected(deviceID)
-                // Safety: a dropped connection must not leave synthetic modifier
-                // keys latched (a stuck Ctrl turns every left click into a right
-                // click system-wide).
-                self.eventInjector.releaseAllModifiers()
-                connection.cancel()
+                self.teardown(connection, reason: error.map { "receive error: \($0)" } ?? "stream complete")
                 return
             }
             self.receive(on: connection)
@@ -421,8 +470,14 @@ final class NetworkManager {
             // challenge-response below. Only handshake messages are allowed
             // before authentication, so an unauthenticated peer can neither
             // inject input nor read system/app information.
-            let openTypes: Set<String> = ["hello", "pair_request", "auth_proof"]
+            let openTypes: Set<String> = ["hello", "pair_request", "auth_proof", "bye"]
             if !openTypes.contains(type) && !box.authenticated {
+                return
+            }
+            // Explicit goodbye from the phone's Disconnect button: tear down
+            // NOW instead of waiting for the socket to die on its own.
+            if type == "bye" {
+                self.teardown(connection, reason: "client said bye")
                 return
             }
             // User-controlled "Pause Input": drop injection messages while
@@ -1538,13 +1593,14 @@ private extension NetworkManager {
         queue.asyncAfter(deadline: .now() + delay) { [weak self, weak connection] in
             guard let self, let connection else { return }
             let focused = Self.focusedElementIsTextInput()
-            if focused != self.lastTextFocusState {
-                self.lastTextFocusState = focused
-                self.sendLine(connection, jsonObject: [
-                    "type": "text_focus",
-                    "payload": ["focused": focused]
-                ])
-            }
+            self.lastTextFocusState = focused
+            // Click-driven checks send UNCONDITIONALLY: change-gating here
+            // proved fragile (a stale "already focused" suppressed the event
+            // the phone needed). Repeats are idempotent on the client.
+            self.sendLine(connection, jsonObject: [
+                "type": "text_focus",
+                "payload": ["focused": focused]
+            ])
         }
     }
 
@@ -1761,8 +1817,10 @@ private extension NetworkManager {
         guard let desktops = try? _enumerateDesktops(), !desktops.isEmpty,
               let winInfo = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else { return }
         let spaceMap = _buildWindowToSpaceIndexMap()
-        guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false) else { return }
-        let scByID = Dictionary(content.windows.map { (Int($0.windowID), $0) },
+        // If shareable-content enumeration fails we still send previews —
+        // silhouettes only. Aborting here left the phone with nothing at all.
+        let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        let scByID = Dictionary((content?.windows ?? []).map { (Int($0.windowID), $0) },
                                 uniquingKeysWith: { a, _ in a })
 
         let screen = NSScreen.main?.frame ?? CGRect(x: 0, y: 0, width: 1728, height: 1117)

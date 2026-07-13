@@ -53,7 +53,23 @@ final class EventInjector {
 
     // Reused across events: allocating a CGEventSource per move (up to 120/s)
     // is measurable overhead on the injection path.
-    private let moveSource = CGEventSource(stateID: .hidSystemState)
+    //
+    // CRITICAL: a default CGEventSource suppresses the user's PHYSICAL
+    // keyboard/mouse for ~0.25s after every synthetic event. With a
+    // continuous move stream that window never closes — the Mac's own input
+    // goes completely dead while the phone is connected. Zero the interval
+    // and permit all local events so remote control never locks the user out.
+    private static func makeNonSuppressingSource() -> CGEventSource? {
+        let source = CGEventSource(stateID: .hidSystemState)
+        source?.localEventsSuppressionInterval = 0
+        let permitAll: CGEventFilterMask = [.permitLocalMouseEvents,
+                                            .permitLocalKeyboardEvents,
+                                            .permitSystemDefinedEvents]
+        source?.setLocalEventsFilterDuringSuppressionState(permitAll, state: .eventSuppressionStateSuppressionInterval)
+        source?.setLocalEventsFilterDuringSuppressionState(permitAll, state: .eventSuppressionStateRemoteMouseDrag)
+        return source
+    }
+    private let moveSource = EventInjector.makeNonSuppressingSource()
     private var didAssociateCursor = false
 
     func moveMouse(dx: Double, dy: Double) throws {
@@ -130,8 +146,8 @@ final class EventInjector {
         // a double-click, so Touch mode couldn't open files without this.
         let clicks = max(1, min(count, 3))
         for state in 1...clicks {
-            guard let down = CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: pos, mouseButton: button),
-                  let up = CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: pos, mouseButton: button) else { throw InjectError.eventCreateFailed }
+            guard let down = CGEvent(mouseEventSource: moveSource, mouseType: downType, mouseCursorPosition: pos, mouseButton: button),
+                  let up = CGEvent(mouseEventSource: moveSource, mouseType: upType, mouseCursorPosition: pos, mouseButton: button) else { throw InjectError.eventCreateFailed }
             // Clear modifier flags explicitly: a latched synthetic Ctrl (from the
             // keyboard's modifier toggles or an interrupted chord) otherwise rides
             // along and macOS treats Ctrl+LeftClick as a RIGHT click (context menu).
@@ -149,19 +165,19 @@ final class EventInjector {
         // Use pixel-based scrolling for smooth trackpad-like behavior.
         let pixelsY = Int32(dy)
         let pixelsX = Int32(dx)
-        guard let ev = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: pixelsY, wheel2: pixelsX, wheel3: 0) else { throw InjectError.eventCreateFailed }
+        guard let ev = CGEvent(scrollWheelEvent2Source: moveSource, units: .pixel, wheelCount: 2, wheel1: pixelsY, wheel2: pixelsX, wheel3: 0) else { throw InjectError.eventCreateFailed }
         ev.post(tap: .cghidEventTap)
     }
 
     func keyDown(keyCode: CGKeyCode) throws {
         print("[EventInjector] keyDown keyCode=\(keyCode)")
-        guard let ev = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true) else { throw InjectError.eventCreateFailed }
+        guard let ev = CGEvent(keyboardEventSource: moveSource, virtualKey: keyCode, keyDown: true) else { throw InjectError.eventCreateFailed }
         ev.post(tap: .cghidEventTap)
     }
 
     func keyUp(keyCode: CGKeyCode) throws {
         print("[EventInjector] keyUp keyCode=\(keyCode)")
-        guard let ev = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else { throw InjectError.eventCreateFailed }
+        guard let ev = CGEvent(keyboardEventSource: moveSource, virtualKey: keyCode, keyDown: false) else { throw InjectError.eventCreateFailed }
         ev.post(tap: .cghidEventTap)
     }
 
@@ -172,7 +188,7 @@ final class EventInjector {
         print("[EventInjector] releaseAllModifiers")
         let modifierKeyCodes: [CGKeyCode] = [55, 58, 59, 56, 63] // Cmd, Opt, Ctrl, Shift, Fn
         for code in modifierKeyCodes {
-            if let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) {
+            if let up = CGEvent(keyboardEventSource: moveSource, virtualKey: code, keyDown: false) {
                 up.flags = []
                 up.post(tap: .cghidEventTap)
             }
@@ -198,7 +214,7 @@ final class EventInjector {
             // only the disconnect path (kind == nil) clears it.
             if k == .left && kind != nil { continue }
             if CGEventSource.buttonState(.combinedSessionState, button: button),
-               let up = CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: pos, mouseButton: button) {
+               let up = CGEvent(mouseEventSource: moveSource, mouseType: upType, mouseCursorPosition: pos, mouseButton: button) {
                 print("[EventInjector] clearing stale \(k) button")
                 up.flags = []
                 up.post(tap: .cghidEventTap)
@@ -222,7 +238,7 @@ extension EventInjector {
         case .middle:
             button = .center; downType = .otherMouseDown
         }
-        guard let down = CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: pos, mouseButton: button) else {
+        guard let down = CGEvent(mouseEventSource: moveSource, mouseType: downType, mouseCursorPosition: pos, mouseButton: button) else {
             throw InjectError.eventCreateFailed
         }
         down.flags = []  // never let a latched modifier turn this into Ctrl+click
@@ -244,7 +260,7 @@ extension EventInjector {
         case .middle:
             button = .center; upType = .otherMouseUp
         }
-        guard let up = CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: pos, mouseButton: button) else {
+        guard let up = CGEvent(mouseEventSource: moveSource, mouseType: upType, mouseCursorPosition: pos, mouseButton: button) else {
             throw InjectError.eventCreateFailed
         }
         up.flags = []  // never let a latched modifier turn this into Ctrl+click
@@ -321,8 +337,8 @@ extension EventInjector {
     private func pressControlArrow(_ keyCode: CGKeyCode) throws {
         print("[EventInjector] pressControlArrow keyCode=\(keyCode)")
         let controlFlag: CGEventFlags = .maskControl
-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true),
-              let up = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else {
+        guard let down = CGEvent(keyboardEventSource: moveSource, virtualKey: keyCode, keyDown: true),
+              let up = CGEvent(keyboardEventSource: moveSource, virtualKey: keyCode, keyDown: false) else {
             throw InjectError.eventCreateFailed
         }
         down.flags = controlFlag
@@ -363,8 +379,8 @@ extension EventInjector {
         if option { flags.insert(.maskAlternate) }
         if control { flags.insert(.maskControl) }
         if shift { flags.insert(.maskShift) }
-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true),
-              let up = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else {
+        guard let down = CGEvent(keyboardEventSource: moveSource, virtualKey: keyCode, keyDown: true),
+              let up = CGEvent(keyboardEventSource: moveSource, virtualKey: keyCode, keyDown: false) else {
             throw InjectError.eventCreateFailed
         }
         down.flags = flags
@@ -376,8 +392,8 @@ extension EventInjector {
     private func pressCommandKey(_ keyCode: CGKeyCode) throws {
         print("[EventInjector] pressCommandKey keyCode=\(keyCode)")
         let commandFlag: CGEventFlags = .maskCommand
-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true),
-              let up = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else {
+        guard let down = CGEvent(keyboardEventSource: moveSource, virtualKey: keyCode, keyDown: true),
+              let up = CGEvent(keyboardEventSource: moveSource, virtualKey: keyCode, keyDown: false) else {
             throw InjectError.eventCreateFailed
         }
         down.flags = commandFlag
@@ -437,8 +453,8 @@ extension EventInjector {
         var i = 0
         while i < units.count {
             let chunk = Array(units[i..<min(i + chunkSize, units.count)])
-            guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-                  let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+            guard let down = CGEvent(keyboardEventSource: moveSource, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: moveSource, virtualKey: 0, keyDown: false) else {
                 throw InjectError.eventCreateFailed
             }
             down.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
@@ -459,8 +475,8 @@ extension EventInjector {
     /// Locks the screen via the system shortcut Ctrl+Cmd+Q.
     private func lockScreen() throws {
         let qKey: CGKeyCode = 12
-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: qKey, keyDown: true),
-              let up = CGEvent(keyboardEventSource: nil, virtualKey: qKey, keyDown: false) else {
+        guard let down = CGEvent(keyboardEventSource: moveSource, virtualKey: qKey, keyDown: true),
+              let up = CGEvent(keyboardEventSource: moveSource, virtualKey: qKey, keyDown: false) else {
             throw InjectError.eventCreateFailed
         }
         let flags: CGEventFlags = [.maskCommand, .maskControl]
