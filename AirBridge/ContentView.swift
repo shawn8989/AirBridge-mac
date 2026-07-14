@@ -155,7 +155,7 @@ private struct StatusTab: View {
     @AppStorage("airbridge.setupDismissed") private var setupDismissed = false
 
     private var needsSetup: Bool {
-        !appState.accessibilityOK ||
+        !appState.accessibilityOK || !appState.screenRecordingOK ||
         (!setupDismissed && appState.knownDeviceIDs.isEmpty && appState.connectedDevices.isEmpty)
     }
 
@@ -289,6 +289,15 @@ private struct SetupChecklist: View {
                          subtitle: "System Settings → Privacy & Security → Accessibility") {
                 if !appState.accessibilityOK {
                     Button("Open Settings") { appState.openAccessibilitySettings() }
+                        .controlSize(.small)
+                }
+            }
+
+            checklistRow(done: appState.screenRecordingOK,
+                         title: "Allow Screen Recording (for Live Screen)",
+                         subtitle: "System Settings → Privacy & Security → Screen Recording") {
+                if !appState.screenRecordingOK {
+                    Button("Open Settings") { appState.openScreenRecordingSettings() }
                         .controlSize(.small)
                 }
             }

@@ -4,128 +4,410 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AirPad — Control your Mac from your iPhone</title>
-<meta name="description" content="AirPad turns your iPhone into a trackpad, keyboard, Wii-style air mouse, and camera hand-gesture controller for your Mac. Private, encrypted, on your own Wi-Fi.">
+<meta name="description" content="AirPad turns your iPhone into a trackpad, keyboard, Wii-style air mouse, and camera hand-gesture controller for your Mac. Private, encrypted, on your own Wi-Fi. No ads, no subscription.">
+<meta property="og:title" content="AirPad — Control your Mac from your iPhone">
+<meta property="og:description" content="Trackpad, keyboard, air mouse, and camera hand gestures. Encrypted on your own Wi-Fi. No ads, no subscription.">
+<meta property="og:type" content="website">
 <style>
 :root {
-  --indigo: #4f46e5; --blue: #2563eb;
-  --bg: #ffffff; --fg: #111827; --muted: #6b7280; --card: #f3f4f6; --border: #e5e7eb;
+  --indigo: #4f46e5; --blue: #2563eb; --violet: #7c3aed;
+  --bg: #ffffff; --fg: #111827; --muted: #6b7280; --card: #f3f4f6;
+  --border: #e5e7eb; --navbg: rgba(255,255,255,.82); --accent-soft: #eef2ff;
 }
 @media (prefers-color-scheme: dark) {
-  :root { --bg: #0b1020; --fg: #f3f4f6; --muted: #9ca3af; --card: #151b31; --border: #263049; }
+  :root { --bg: #0b1020; --fg: #f3f4f6; --muted: #9ca3af; --card: #151b31;
+          --border: #263049; --navbg: rgba(11,16,32,.82); --accent-soft: #1a2142; }
 }
 * { box-sizing: border-box; margin: 0; }
+html { scroll-behavior: smooth; }
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
        background: var(--bg); color: var(--fg); line-height: 1.6; }
-.wrap { max-width: 860px; margin: 0 auto; padding: 0 20px; }
-.hero { background: linear-gradient(160deg, var(--indigo), var(--blue));
-        color: #fff; text-align: center; padding: 72px 20px 64px; }
-.hero h1 { font-size: clamp(2rem, 5vw, 3.2rem); line-height: 1.15; margin-bottom: 14px; }
-.hero p  { font-size: 1.15rem; opacity: .92; max-width: 560px; margin: 0 auto 30px; }
-.badge { display: inline-block; background: rgba(255,255,255,.16); border: 1px solid rgba(255,255,255,.35);
-         border-radius: 999px; padding: 6px 14px; font-size: .85rem; margin-bottom: 22px; }
+.wrap { max-width: 980px; margin: 0 auto; padding: 0 20px; }
+
+/* ---- nav ---- */
+nav { position: sticky; top: 0; z-index: 50; backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px); background: var(--navbg);
+      border-bottom: 1px solid var(--border); }
+nav .wrap { display: flex; align-items: center; gap: 20px; height: 56px; }
+nav .brand { font-weight: 800; font-size: 1.05rem; text-decoration: none; color: var(--fg);
+             display: flex; align-items: center; gap: 8px; }
+nav .brand .logo { width: 26px; height: 26px; border-radius: 7px;
+  background: linear-gradient(150deg, var(--indigo), var(--blue));
+  display: inline-flex; align-items: center; justify-content: center;
+  color: #fff; font-size: .8rem; }
+nav .links { margin-left: auto; display: flex; gap: 18px; align-items: center; }
+nav .links a { color: var(--muted); text-decoration: none; font-size: .92rem; font-weight: 500; }
+nav .links a:hover { color: var(--fg); }
+nav .links .cta { background: var(--indigo); color: #fff; padding: 7px 14px;
+                  border-radius: 9px; font-weight: 600; }
+nav .links .cta:hover { color: #fff; filter: brightness(1.1); }
+@media (max-width: 620px) { nav .links a:not(.cta) { display: none; } }
+
+/* ---- hero ---- */
+.hero { background:
+    radial-gradient(1000px 500px at 20% -10%, rgba(124,58,237,.35), transparent 60%),
+    radial-gradient(900px 500px at 85% 0%, rgba(37,99,235,.35), transparent 55%),
+    linear-gradient(165deg, var(--indigo), var(--blue));
+  color: #fff; text-align: center; padding: 84px 20px 72px; overflow: hidden; }
+.hero h1 { font-size: clamp(2.1rem, 5.4vw, 3.5rem); line-height: 1.12; margin-bottom: 16px;
+           letter-spacing: -.02em; }
+.hero p.lede { font-size: 1.18rem; opacity: .93; max-width: 590px; margin: 0 auto 32px; }
+.badge { display: inline-block; background: rgba(255,255,255,.15); border: 1px solid rgba(255,255,255,.35);
+         border-radius: 999px; padding: 6px 16px; font-size: .85rem; margin-bottom: 24px;
+         font-weight: 500; }
 .btns { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
-.btn  { display: inline-block; padding: 13px 26px; border-radius: 12px; text-decoration: none;
-        font-weight: 600; font-size: 1rem; }
-.btn-light { background: #fff; color: var(--indigo); }
-.btn-ghost { background: rgba(255,255,255,.14); color: #fff; border: 1px solid rgba(255,255,255,.4); }
-section { padding: 56px 0; }
-h2 { font-size: 1.7rem; margin-bottom: 24px; text-align: center; }
-.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 16px; }
-.card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 22px; }
-.card .emoji { font-size: 1.9rem; }
-.card h3 { margin: 10px 0 6px; font-size: 1.05rem; }
+.btn  { display: inline-block; padding: 14px 28px; border-radius: 13px; text-decoration: none;
+        font-weight: 600; font-size: 1.02rem; transition: transform .15s ease; }
+.btn:hover { transform: translateY(-1px); }
+.btn-light { background: #fff; color: var(--indigo); box-shadow: 0 8px 24px rgba(0,0,0,.18); }
+.btn-ghost { background: rgba(255,255,255,.13); color: #fff; border: 1px solid rgba(255,255,255,.4); }
+.version-note { margin-top: 14px; font-size: .84rem; opacity: .75; }
+
+/* ---- hero illustration ---- */
+.scene { display: flex; align-items: flex-end; justify-content: center; gap: 40px;
+         margin: 52px auto 0; max-width: 640px; }
+.mac { flex: 1 1 380px; max-width: 430px; }
+.mac .screen { aspect-ratio: 16/10; border-radius: 14px 14px 4px 4px;
+  background: linear-gradient(200deg, #1e293b, #0f172a); border: 3px solid #334155;
+  position: relative; overflow: hidden; box-shadow: 0 24px 50px rgba(0,0,0,.35); }
+.mac .base { height: 12px; background: linear-gradient(#94a3b8, #64748b);
+  border-radius: 0 0 12px 12px; margin: 0 -6%; }
+.mac .dock { position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%);
+  display: flex; gap: 6px; background: rgba(255,255,255,.12); padding: 5px 8px;
+  border-radius: 9px; }
+.mac .dock i { width: 14px; height: 14px; border-radius: 4px; display: block; }
+.mac .win { position: absolute; border-radius: 6px; background: rgba(255,255,255,.10);
+  border: 1px solid rgba(255,255,255,.14); }
+.cursor-dot { position: absolute; width: 10px; height: 10px; border-radius: 50%;
+  background: #fff; box-shadow: 0 0 0 5px rgba(99,102,241,.45), 0 0 18px rgba(99,102,241,.9);
+  animation: roam 7s ease-in-out infinite; }
+@keyframes roam {
+  0%   { top: 30%; left: 22%; } 25% { top: 55%; left: 60%; }
+  50%  { top: 26%; left: 72%; } 75% { top: 62%; left: 34%; }
+  100% { top: 30%; left: 22%; } }
+.phone { width: 92px; flex: 0 0 92px; aspect-ratio: 9/19; border-radius: 18px;
+  background: linear-gradient(210deg, #1e293b, #0b1224); border: 3px solid #334155;
+  position: relative; box-shadow: 0 18px 40px rgba(0,0,0,.35);
+  animation: tilt 7s ease-in-out infinite; }
+@keyframes tilt { 0% { transform: rotate(-6deg); } 25% { transform: rotate(5deg); }
+  50% { transform: rotate(8deg); } 75% { transform: rotate(-4deg); }
+  100% { transform: rotate(-6deg); } }
+.phone .notch { position: absolute; top: 7px; left: 50%; transform: translateX(-50%);
+  width: 34%; height: 7px; border-radius: 5px; background: #0b1224; border: 1px solid #334155; }
+.phone .pad { position: absolute; inset: 22% 12% 14%; border-radius: 10px;
+  background: rgba(99,102,241,.18); border: 1px dashed rgba(148,163,184,.5); }
+.phone .touch { position: absolute; width: 16px; height: 16px; border-radius: 50%;
+  background: rgba(165,180,252,.9); animation: roam 7s ease-in-out infinite; }
+@media (max-width: 560px) { .scene { gap: 22px; } .phone { width: 68px; flex-basis: 68px; } }
+
+/* ---- sections ---- */
+section { padding: 64px 0; }
+section.alt { background: var(--card); border-top: 1px solid var(--border);
+              border-bottom: 1px solid var(--border); }
+h2 { font-size: clamp(1.5rem, 3vw, 1.9rem); margin-bottom: 10px; text-align: center;
+     letter-spacing: -.01em; }
+.sub { text-align: center; color: var(--muted); max-width: 620px; margin: 0 auto 36px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; }
+.card { background: var(--bg); border: 1px solid var(--border); border-radius: 16px; padding: 24px; }
+section:not(.alt) .card { background: var(--card); }
+.card .emoji { font-size: 2rem; }
+.card h3 { margin: 12px 0 6px; font-size: 1.08rem; }
 .card p  { color: var(--muted); font-size: .93rem; }
-.steps { counter-reset: step; max-width: 560px; margin: 0 auto; }
-.step { display: flex; gap: 16px; align-items: flex-start; padding: 14px 0; border-bottom: 1px solid var(--border); }
+.card .pro { display: inline-block; font-size: .68rem; font-weight: 700; letter-spacing: .06em;
+  color: var(--indigo); background: var(--accent-soft); border-radius: 5px;
+  padding: 2px 7px; margin-left: 6px; vertical-align: 2px; }
+
+/* ---- steps ---- */
+.steps { counter-reset: step; max-width: 600px; margin: 0 auto; }
+.step { display: flex; gap: 16px; align-items: flex-start; padding: 16px 0;
+        border-bottom: 1px solid var(--border); }
 .step:last-child { border-bottom: none; }
 .step .n { counter-increment: step; background: var(--indigo); color: #fff; border-radius: 50%;
-           width: 30px; height: 30px; flex: 0 0 30px; display: flex; align-items: center;
+           width: 32px; height: 32px; flex: 0 0 32px; display: flex; align-items: center;
            justify-content: center; font-weight: 700; }
 .step .n::before { content: counter(step); }
-.faq details { background: var(--card); border: 1px solid var(--border); border-radius: 12px;
-               padding: 14px 18px; margin-bottom: 10px; }
+.step small { color: var(--muted); display: block; }
+
+/* ---- security strip ---- */
+.security { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+            gap: 14px; max-width: 900px; margin: 0 auto; }
+.security .item { display: flex; gap: 12px; align-items: flex-start; background: var(--bg);
+  border: 1px solid var(--border); border-radius: 14px; padding: 16px 18px; }
+.security .item .ic { font-size: 1.3rem; }
+.security .item b { display: block; font-size: .95rem; }
+.security .item span { color: var(--muted); font-size: .86rem; }
+
+/* ---- pricing ---- */
+.pricing-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+                 gap: 18px; max-width: 720px; margin: 0 auto; }
+.price-card { border: 1px solid var(--border); border-radius: 18px; padding: 28px;
+              background: var(--bg); text-align: center; }
+.price-card.featured { border: 2px solid var(--indigo);
+  box-shadow: 0 12px 36px rgba(79,70,229,.16); position: relative; }
+.price-card.featured::before { content: "7-day free trial"; position: absolute; top: -13px;
+  left: 50%; transform: translateX(-50%); background: var(--indigo); color: #fff;
+  font-size: .74rem; font-weight: 700; padding: 3px 12px; border-radius: 999px; }
+.price-card h3 { font-size: 1.1rem; }
+.price-card .amount { font-size: 2.4rem; font-weight: 800; margin: 8px 0 2px; }
+.price-card .per { color: var(--muted); font-size: .88rem; margin-bottom: 16px; }
+.price-card ul { list-style: none; padding: 0; text-align: left; color: var(--muted);
+                 font-size: .92rem; }
+.price-card li { padding: 5px 0 5px 26px; position: relative; }
+.price-card li::before { content: "✓"; position: absolute; left: 4px; color: var(--indigo);
+                          font-weight: 700; }
+
+/* ---- faq ---- */
+.faq details { background: var(--bg); border: 1px solid var(--border); border-radius: 12px;
+               padding: 15px 20px; margin-bottom: 10px; max-width: 760px;
+               margin-left: auto; margin-right: auto; }
+section.alt .faq details { background: var(--bg); }
 .faq summary { font-weight: 600; cursor: pointer; }
 .faq p { color: var(--muted); margin-top: 8px; font-size: .95rem; }
-footer { border-top: 1px solid var(--border); padding: 28px 0; text-align: center;
+.faq a { color: var(--indigo); }
+
+/* ---- final cta ---- */
+.final { text-align: center; }
+.final .btn-dl { background: var(--indigo); color: #fff; box-shadow: 0 10px 28px rgba(79,70,229,.3); }
+
+footer { border-top: 1px solid var(--border); padding: 30px 0; text-align: center;
          color: var(--muted); font-size: .9rem; }
 footer a { color: var(--muted); }
-.pricing { text-align: center; }
-.pricing .price { font-size: 2.2rem; font-weight: 800; }
-.pricing .sub { color: var(--muted); }
 </style>
 </head>
 <body>
 
-<div class="hero">
-  <div class="badge">No ads • No subscription • One price, yours forever</div>
+<nav>
+  <div class="wrap">
+    <a class="brand" href="#top"><span class="logo">⌘</span>AirPad</a>
+    <div class="links">
+      <a href="#features">Features</a>
+      <a href="#how">How it works</a>
+      <a href="#security">Privacy</a>
+      <a href="#pricing">Pricing</a>
+      <a href="#faq">FAQ</a>
+      <a class="cta" href="https://github.com/shawn8989/AirBridge-mac/releases/latest">Download</a>
+    </div>
+  </div>
+</nav>
+
+<div class="hero" id="top">
+  <div class="badge">No ads &nbsp;•&nbsp; No subscription &nbsp;•&nbsp; One price, yours forever</div>
   <h1>Control your Mac<br>from your iPhone</h1>
-  <p>Trackpad, keyboard, Wii-style air mouse, and camera hand gestures —
-     encrypted on your own Wi-Fi, nothing ever leaves your network.</p>
+  <p class="lede">Trackpad, keyboard, Wii-style air mouse, and camera hand gestures —
+     encrypted on your own Wi-Fi. Nothing ever leaves your network.</p>
   <div class="btns">
     <a class="btn btn-light" href="https://github.com/shawn8989/AirBridge-mac/releases/latest">⬇︎&nbsp; Download AirBridge for Mac</a>
-    <a class="btn btn-ghost" href="#appstore">Get AirPad on the App&nbsp;Store</a>
+    <a class="btn btn-ghost" href="#pricing">Get AirPad on the App&nbsp;Store</a>
+  </div>
+  <p class="version-note" id="version-note">Free · macOS 14 or later</p>
+
+  <div class="scene" aria-hidden="true">
+    <div class="mac">
+      <div class="screen">
+        <div class="win" style="top:12%; left:8%;  width:42%; height:52%;"></div>
+        <div class="win" style="top:22%; left:56%; width:36%; height:44%;"></div>
+        <div class="dock">
+          <i style="background:#60a5fa"></i><i style="background:#f472b6"></i>
+          <i style="background:#34d399"></i><i style="background:#fbbf24"></i>
+          <i style="background:#a78bfa"></i>
+        </div>
+        <div class="cursor-dot"></div>
+      </div>
+      <div class="base"></div>
+    </div>
+    <div class="phone">
+      <div class="notch"></div>
+      <div class="pad"><div class="touch"></div></div>
+    </div>
   </div>
 </div>
 
-<section>
+<section id="features">
   <div class="wrap">
     <h2>One phone. Every way to control a Mac.</h2>
+    <p class="sub">The trackpad, keyboard, and your first Mac are free forever.
+       Pro features are marked below.</p>
     <div class="grid">
-      <div class="card"><div class="emoji">🖱️</div><h3>Trackpad & Keyboard</h3>
-        <p>Buttery-smooth cursor, taps, drags, scrolling, and 3–4 finger swipes for Mission Control and desktops. Full keyboard with modifiers.</p></div>
-      <div class="card"><div class="emoji">🪄</div><h3>Air Mouse</h3>
-        <p>Point your phone like a Wii remote to steer the cursor. Tap to click, tilt to scroll, snap your wrist to switch desktops. A perfect presentation clicker.</p></div>
-      <div class="card"><div class="emoji">✋</div><h3>Hand Mouse</h3>
-        <p>The front camera tracks your hand: point to move, pinch to click, fist to drag, palm-swipe to change desktops. All processed on your iPhone.</p></div>
-      <div class="card"><div class="emoji">🎛️</div><h3>And the rest</h3>
-        <p>Media & volume keys, presentation remote, clipboard sync, dictation typed straight onto your Mac, live screen view, app launcher.</p></div>
+      <div class="card"><div class="emoji">🖱️</div><h3>Trackpad &amp; Keyboard</h3>
+        <p>Buttery-smooth cursor, taps, drags, scrolling, and 3–4 finger swipes for
+           Mission Control and switching desktops. Full keyboard with ⌘⌥⌃⇧ modifiers —
+           and it pops up automatically when you click a text field.</p></div>
+      <div class="card"><div class="emoji">🪄</div><h3>Air Mouse<span class="pro">PRO</span></h3>
+        <p>Point your phone like a Wii remote to steer the cursor. Tap to click, tilt to
+           scroll, snap your wrist to switch desktops. A perfect presentation clicker.</p></div>
+      <div class="card"><div class="emoji">✋</div><h3>Hand Mouse<span class="pro">PRO</span></h3>
+        <p>The front camera tracks your hand: point to move, pinch to click, fist to
+           drag, palm-swipe to change desktops. All processed on your iPhone —
+           video never leaves the device.</p></div>
+      <div class="card"><div class="emoji">🎬</div><h3>Gesture Studio<span class="pro">PRO</span></h3>
+        <p>Record your own hand poses — a peace sign, a shaka, whatever you invent —
+           and map them to shortcuts, media keys, text snippets, or Mission Control.</p></div>
+      <div class="card"><div class="emoji">🖥️</div><h3>Live Screen<span class="pro">PRO</span></h3>
+        <p>See your Mac's screen live on your phone and tap exactly what you see —
+           tap to click, drag to move, long-press to right-click.</p></div>
+      <div class="card"><div class="emoji">🗂️</div><h3>Desktops &amp; Apps<span class="pro">PRO</span></h3>
+        <p>Every desktop and open window on one screen. Tap a desktop to jump there,
+           or tap a window to bring it to the front — even if it's on another Space.</p></div>
+      <div class="card"><div class="emoji">🎵</div><h3>Media Remote<span class="pro">PRO</span></h3>
+        <p>Now Playing with track info, play/pause/skip, a real volume slider,
+           brightness, presentation next/previous, and lock-screen from the couch.</p></div>
+      <div class="card"><div class="emoji">🎙️</div><h3>Dictation &amp; Clipboard<span class="pro">PRO</span></h3>
+        <p>Speak into your phone, watch the words appear on your Mac. Push and pull
+           the clipboard both directions.</p></div>
     </div>
   </div>
 </section>
 
-<section>
+<section class="alt" id="how">
   <div class="wrap">
     <h2>Set up in under a minute</h2>
+    <p class="sub">Two apps: <strong>AirBridge</strong> runs quietly on the Mac (menu bar),
+       <strong>AirPad</strong> is the remote on your iPhone.</p>
     <div class="steps">
-      <div class="step"><div class="n"></div><div><strong>Download AirBridge</strong> on your Mac (free) and open it.</div></div>
+      <div class="step"><div class="n"></div><div><strong>Download AirBridge</strong> on your Mac (free) and open it.
+        <small>Grant the Accessibility permission when asked — that's how it moves your cursor.</small></div></div>
       <div class="step"><div class="n"></div><div><strong>Get AirPad</strong> on your iPhone from the App Store.</div></div>
-      <div class="step"><div class="n"></div><div><strong>Same Wi-Fi, tap your Mac, approve the pairing.</strong> Done — it remembers you.</div></div>
+      <div class="step"><div class="n"></div><div><strong>Same Wi-Fi, tap your Mac, approve the pairing.</strong>
+        <small>Or scan the QR code in AirBridge for instant pairing. Either way, it remembers you.</small></div></div>
     </div>
   </div>
 </section>
 
-<section id="appstore">
-  <div class="wrap pricing">
-    <h2>Fair pricing</h2>
-    <p class="sub">Trackpad, keyboard, and your first Mac — <strong>free forever</strong>.<br>
-       Everything unlocked free for 7 days, then:</p>
-    <p class="price">$7.99 once</p>
-    <p class="sub">AirPad Pro: Air Mouse, Hand Mouse, media & presentation remote,<br>
-       dictation, live screen, apps, multi-Mac. No ads. No subscription.</p>
+<section id="security">
+  <div class="wrap">
+    <h2>Private by design</h2>
+    <p class="sub">AirPad was built the way a remote-control app should be:
+       your Mac obeys your phone, and no one else — including us.</p>
+    <div class="security">
+      <div class="item"><div class="ic">🔒</div><div><b>Encrypted, always</b>
+        <span>Every packet between phone and Mac is TLS-encrypted.</span></div></div>
+      <div class="item"><div class="ic">🏠</div><div><b>Local network only</b>
+        <span>Works only on your Wi-Fi. Your Mac is never exposed to the internet.</span></div></div>
+      <div class="item"><div class="ic">🤝</div><div><b>Paired devices only</b>
+        <span>Each phone is individually approved and cryptographically authenticated.</span></div></div>
+      <div class="item"><div class="ic">📷</div><div><b>Camera stays on-device</b>
+        <span>Hand tracking runs entirely on the iPhone. Video is never transmitted.</span></div></div>
+      <div class="item"><div class="ic">🚫</div><div><b>No accounts, no tracking</b>
+        <span>No sign-up, no analytics, no data collection. We literally have no servers.</span></div></div>
+      <div class="item"><div class="ic">📄</div><div><b>Plain-English policy</b>
+        <span>Read the whole <a href="privacy.html" style="color:var(--indigo)">privacy policy</a> in two minutes.</span></div></div>
+    </div>
   </div>
 </section>
 
-<section class="faq">
+<section class="alt" id="pricing">
+  <div class="wrap">
+    <h2>Fair pricing</h2>
+    <p class="sub">Try everything free for 7 days. Then keep the free tier forever,
+       or unlock Pro once and own it.</p>
+    <div class="pricing-cards">
+      <div class="price-card">
+        <h3>Free</h3>
+        <div class="amount">$0</div>
+        <div class="per">forever</div>
+        <ul>
+          <li>Trackpad with multi-finger gestures</li>
+          <li>Full keyboard with modifiers</li>
+          <li>Your first Mac</li>
+          <li>AirBridge for Mac included</li>
+        </ul>
+      </div>
+      <div class="price-card featured">
+        <h3>AirPad Pro</h3>
+        <div class="amount">$7.99</div>
+        <div class="per">one time — no subscription, ever</div>
+        <ul>
+          <li>Air Mouse &amp; Hand Mouse</li>
+          <li>Gesture Studio custom gestures</li>
+          <li>Live Screen with touch control</li>
+          <li>Desktops &amp; Apps switcher</li>
+          <li>Media, dictation &amp; clipboard</li>
+          <li>Unlimited Macs</li>
+          <li>All future features</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="faq" id="faq">
   <div class="wrap">
     <h2>Questions</h2>
     <details><summary>Is my data safe?</summary>
-      <p>Yes. Everything stays on your local Wi-Fi, encrypted with TLS. Each phone is individually paired and authenticated — your Mac only obeys devices you approved. Camera and microphone are processed entirely on the iPhone and never transmitted. We collect nothing. See the <a href="privacy.html">privacy policy</a>.</p></details>
+      <p>Yes. Everything stays on your local Wi-Fi, encrypted with TLS. Each phone is
+         individually paired and authenticated — your Mac only obeys devices you approved.
+         Camera and microphone are processed entirely on the iPhone and never transmitted.
+         We collect nothing. See the <a href="privacy.html">privacy policy</a>.</p></details>
     <details><summary>Why isn't AirBridge in the Mac App Store?</summary>
-      <p>Apps that control the mouse and keyboard need the Accessibility permission, which Mac App Store rules don't allow. AirBridge is signed and notarized by Apple's security check instead — the standard for this category.</p></details>
+      <p>Apps that control the mouse and keyboard need the Accessibility permission, which
+         Mac App Store rules don't allow. AirBridge is distributed the standard way for this
+         category: downloaded directly, signed, and notarized through Apple's security check.
+         Gatekeeper verifies it before it ever runs.</p></details>
+    <details><summary>Is downloading from GitHub safe?</summary>
+      <p>Yes — GitHub Releases is where a huge amount of trusted Mac software ships from
+         (Rectangle, IINA, Stats, and many more). The download link on this page always
+         points to the latest official release, and the app is notarized by Apple, so
+         macOS independently verifies it hasn't been tampered with.</p></details>
     <details><summary>What does AirBridge need to work?</summary>
-      <p>macOS 14 or later, and the Accessibility permission (System Settings → Privacy & Security → Accessibility) so it can move the cursor and type on your behalf.</p></details>
+      <p>macOS 14 or later, and the Accessibility permission (System Settings → Privacy
+         &amp; Security → Accessibility) so it can move the cursor and type on your behalf.
+         Live Screen additionally uses the Screen Recording permission — AirBridge's
+         dashboard walks you through both.</p></details>
     <details><summary>Does it work over the internet?</summary>
-      <p>No — by design. AirPad only works on your local network, which is a security feature: your Mac is never exposed to the internet.</p></details>
+      <p>By design, AirPad works on your local network — a security feature: your Mac
+         is never exposed to the internet. Pro users who want access from anywhere can
+         pair AirPad with a personal VPN like <a href="https://tailscale.com">Tailscale</a>
+         (free for personal use): install it on both devices, then use
+         "Connect by Address" in AirPad. Same encryption, no accounts, no servers of ours
+         in the middle.</p></details>
+    <details><summary>Can it wake my Mac up?</summary>
+      <p>Yes. Moving the trackpad wakes a dark display, and the Wake menu can wake a
+         sleeping Mac over the network — just enable "Wake for network access" in
+         System Settings → Battery → Options.</p></details>
+    <details><summary>How do updates work?</summary>
+      <p>AirPad updates through the App Store like any iPhone app. AirBridge checks this
+         site's releases once a day and shows a friendly banner when a new version is
+         ready — nothing installs without you clicking it.</p></details>
+    <details><summary>Is it laggy?</summary>
+      <p>No. AirPad speaks a tiny custom protocol over your local network — cursor moves
+         arrive in a few milliseconds, which is why the trackpad feels like a real trackpad
+         rather than a screen-share.</p></details>
+  </div>
+</section>
+
+<section class="final">
+  <div class="wrap">
+    <h2>Ready when you are</h2>
+    <p class="sub">AirBridge is free. AirPad's trial is free. Worst case, you spend one
+       minute and get a free trackpad out of it.</p>
+    <div class="btns">
+      <a class="btn btn-dl" href="https://github.com/shawn8989/AirBridge-mac/releases/latest">⬇︎&nbsp; Download AirBridge for Mac</a>
+    </div>
   </div>
 </section>
 
 <footer>
   <div class="wrap">
-    AirPad & AirBridge — <a href="privacy.html">Privacy Policy</a> ·
+    AirPad &amp; AirBridge — <a href="privacy.html">Privacy Policy</a> ·
     <a href="https://github.com/shawn8989/AirBridge-mac/releases/latest">Download</a> ·
+    <a href="https://github.com/shawn8989/AirBridge-mac">Source on GitHub</a> ·
     <a href="mailto:owens.shunathon@gmail.com">Support</a>
   </div>
 </footer>
+
+<script>
+// Show the latest AirBridge version in the hero, straight from GitHub Releases.
+// Fails silently — the page is complete without it.
+fetch("https://api.github.com/repos/shawn8989/AirBridge-mac/releases/latest")
+  .then(r => r.ok ? r.json() : null)
+  .then(rel => {
+    if (!rel || !rel.tag_name) return;
+    const note = document.getElementById("version-note");
+    note.textContent = "Latest: AirBridge " + rel.tag_name.replace(/^v/, "") +
+                       " · Free · macOS 14 or later";
+  })
+  .catch(() => {});
+</script>
 
 </body>
 </html>

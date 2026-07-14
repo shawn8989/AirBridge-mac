@@ -53,7 +53,23 @@ final class EventInjector {
 
     // Reused across events: allocating a CGEventSource per move (up to 120/s)
     // is measurable overhead on the injection path.
-    private let moveSource = CGEventSource(stateID: .hidSystemState)
+    //
+    // CRITICAL: a default CGEventSource suppresses the user's PHYSICAL
+    // keyboard/mouse for ~0.25s after every synthetic event. With a
+    // continuous move stream that window never closes — the Mac's own input
+    // goes completely dead while the phone is connected. Zero the interval
+    // and permit all local events so remote control never locks the user out.
+    private static func makeNonSuppressingSource() -> CGEventSource? {
+        let source = CGEventSource(stateID: .hidSystemState)
+        source?.localEventsSuppressionInterval = 0
+        let permitAll: CGEventFilterMask = [.permitLocalMouseEvents,
+                                            .permitLocalKeyboardEvents,
+                                            .permitSystemDefinedEvents]
+        source?.setLocalEventsFilterDuringSuppressionState(permitAll, state: .eventSuppressionStateSuppressionInterval)
+        source?.setLocalEventsFilterDuringSuppressionState(permitAll, state: .eventSuppressionStateRemoteMouseDrag)
+        return source
+    }
+    private let moveSource = EventInjector.makeNonSuppressingSource()
     private var didAssociateCursor = false
 
     func moveMouse(dx: Double, dy: Double) throws {
@@ -86,8 +102,33 @@ final class EventInjector {
         move.post(tap: .cghidEventTap)
     }
 
-    func clickMouse(kind: MouseClickKind) throws {
-        print("[EventInjector] clickMouse kind=\(kind)")
+    /// Moves the cursor to an absolute, display-normalized position (0...1 on
+    /// the main display). Powers "tap what you see" on the Live Screen view.
+    func moveMouseAbsolute(nx: Double, ny: Double) throws {
+        let bounds = CGDisplayBounds(CGMainDisplayID())
+        let point = CGPoint(x: bounds.origin.x + bounds.width * CGFloat(min(max(nx, 0), 1)),
+                            y: bounds.origin.y + bounds.height * CGFloat(min(max(ny, 0), 1)))
+        if !didAssociateCursor {
+            _ = CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+            didAssociateCursor = true
+        }
+        CGWarpMouseCursorPosition(point)
+        let leftDown = CGEventSource.buttonState(.combinedSessionState, button: .left)
+        let type: CGEventType = leftDown ? .leftMouseDragged : .mouseMoved
+        guard let move = CGEvent(mouseEventSource: moveSource, mouseType: type,
+                                 mouseCursorPosition: point, mouseButton: .left) else {
+            throw InjectError.eventCreateFailed
+        }
+        move.post(tap: .cghidEventTap)
+    }
+
+    func clickMouse(kind: MouseClickKind, count: Int = 1) throws {
+        print("[EventInjector] clickMouse kind=\(kind) count=\(count)")
+        // Defensive: a stale latched button (an up event lost to a hiccup)
+        // poisons every later click — e.g. a phantom held RIGHT button makes
+        // left clicks behave as right clicks/context menus. Clear the other
+        // buttons before clicking.
+        clearStaleButtons(except: kind)
         let pos = CGEvent(source: nil)?.location ?? .zero
         let button: CGMouseButton
         let downType: CGEventType
@@ -100,18 +141,23 @@ final class EventInjector {
         case .middle:
             button = .center; downType = .otherMouseDown; upType = .otherMouseUp
         }
-        guard let down = CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: pos, mouseButton: button),
-              let up = CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: pos, mouseButton: button) else { throw InjectError.eventCreateFailed }
-        // Clear modifier flags explicitly: a latched synthetic Ctrl (from the
-        // keyboard's modifier toggles or an interrupted chord) otherwise rides
-        // along and macOS treats Ctrl+LeftClick as a RIGHT click (context menu).
-        down.flags = []
-        up.flags = []
-        // Proper single-click semantics; some apps ignore clicks without it.
-        down.setIntegerValueField(.mouseEventClickState, value: 1)
-        up.setIntegerValueField(.mouseEventClickState, value: 1)
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
+        // Multi-clicks are signalled through mouseEventClickState, not by
+        // repeating single clicks — two clickState=1 clicks never register as
+        // a double-click, so Touch mode couldn't open files without this.
+        let clicks = max(1, min(count, 3))
+        for state in 1...clicks {
+            guard let down = CGEvent(mouseEventSource: moveSource, mouseType: downType, mouseCursorPosition: pos, mouseButton: button),
+                  let up = CGEvent(mouseEventSource: moveSource, mouseType: upType, mouseCursorPosition: pos, mouseButton: button) else { throw InjectError.eventCreateFailed }
+            // Clear modifier flags explicitly: a latched synthetic Ctrl (from the
+            // keyboard's modifier toggles or an interrupted chord) otherwise rides
+            // along and macOS treats Ctrl+LeftClick as a RIGHT click (context menu).
+            down.flags = []
+            up.flags = []
+            down.setIntegerValueField(.mouseEventClickState, value: Int64(state))
+            up.setIntegerValueField(.mouseEventClickState, value: Int64(state))
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+        }
     }
 
     func scroll(dx: Double, dy: Double) throws {
@@ -119,19 +165,19 @@ final class EventInjector {
         // Use pixel-based scrolling for smooth trackpad-like behavior.
         let pixelsY = Int32(dy)
         let pixelsX = Int32(dx)
-        guard let ev = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: pixelsY, wheel2: pixelsX, wheel3: 0) else { throw InjectError.eventCreateFailed }
+        guard let ev = CGEvent(scrollWheelEvent2Source: moveSource, units: .pixel, wheelCount: 2, wheel1: pixelsY, wheel2: pixelsX, wheel3: 0) else { throw InjectError.eventCreateFailed }
         ev.post(tap: .cghidEventTap)
     }
 
     func keyDown(keyCode: CGKeyCode) throws {
         print("[EventInjector] keyDown keyCode=\(keyCode)")
-        guard let ev = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true) else { throw InjectError.eventCreateFailed }
+        guard let ev = CGEvent(keyboardEventSource: moveSource, virtualKey: keyCode, keyDown: true) else { throw InjectError.eventCreateFailed }
         ev.post(tap: .cghidEventTap)
     }
 
     func keyUp(keyCode: CGKeyCode) throws {
         print("[EventInjector] keyUp keyCode=\(keyCode)")
-        guard let ev = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else { throw InjectError.eventCreateFailed }
+        guard let ev = CGEvent(keyboardEventSource: moveSource, virtualKey: keyCode, keyDown: false) else { throw InjectError.eventCreateFailed }
         ev.post(tap: .cghidEventTap)
     }
 
@@ -142,7 +188,34 @@ final class EventInjector {
         print("[EventInjector] releaseAllModifiers")
         let modifierKeyCodes: [CGKeyCode] = [55, 58, 59, 56, 63] // Cmd, Opt, Ctrl, Shift, Fn
         for code in modifierKeyCodes {
-            if let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) {
+            if let up = CGEvent(keyboardEventSource: moveSource, virtualKey: code, keyDown: false) {
+                up.flags = []
+                up.post(tap: .cghidEventTap)
+            }
+        }
+        // Also release any latched mouse buttons — a lost mouse-up otherwise
+        // wedges the session (right-latch turns left clicks into right clicks;
+        // left-latch turns every move into a drag).
+        clearStaleButtons(except: nil)
+    }
+
+    /// Posts an "up" for any button macOS believes is currently held, except
+    /// the one being intentionally used.
+    func clearStaleButtons(except kind: MouseClickKind?) {
+        let pos = CGEvent(source: nil)?.location ?? .zero
+        let checks: [(MouseClickKind, CGMouseButton, CGEventType)] = [
+            (.left, .left, .leftMouseUp),
+            (.right, .right, .rightMouseUp),
+            (.middle, .center, .otherMouseUp)
+        ]
+        for (k, button, upType) in checks {
+            guard k != kind else { continue }
+            // A held LEFT button can be intentional (trackpad drag-lock), so
+            // only the disconnect path (kind == nil) clears it.
+            if k == .left && kind != nil { continue }
+            if CGEventSource.buttonState(.combinedSessionState, button: button),
+               let up = CGEvent(mouseEventSource: moveSource, mouseType: upType, mouseCursorPosition: pos, mouseButton: button) {
+                print("[EventInjector] clearing stale \(k) button")
                 up.flags = []
                 up.post(tap: .cghidEventTap)
             }
@@ -165,7 +238,7 @@ extension EventInjector {
         case .middle:
             button = .center; downType = .otherMouseDown
         }
-        guard let down = CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: pos, mouseButton: button) else {
+        guard let down = CGEvent(mouseEventSource: moveSource, mouseType: downType, mouseCursorPosition: pos, mouseButton: button) else {
             throw InjectError.eventCreateFailed
         }
         down.flags = []  // never let a latched modifier turn this into Ctrl+click
@@ -187,7 +260,7 @@ extension EventInjector {
         case .middle:
             button = .center; upType = .otherMouseUp
         }
-        guard let up = CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: pos, mouseButton: button) else {
+        guard let up = CGEvent(mouseEventSource: moveSource, mouseType: upType, mouseCursorPosition: pos, mouseButton: button) else {
             throw InjectError.eventCreateFailed
         }
         up.flags = []  // never let a latched modifier turn this into Ctrl+click
@@ -264,8 +337,8 @@ extension EventInjector {
     private func pressControlArrow(_ keyCode: CGKeyCode) throws {
         print("[EventInjector] pressControlArrow keyCode=\(keyCode)")
         let controlFlag: CGEventFlags = .maskControl
-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true),
-              let up = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else {
+        guard let down = CGEvent(keyboardEventSource: moveSource, virtualKey: keyCode, keyDown: true),
+              let up = CGEvent(keyboardEventSource: moveSource, virtualKey: keyCode, keyDown: false) else {
             throw InjectError.eventCreateFailed
         }
         down.flags = controlFlag
@@ -298,11 +371,29 @@ extension EventInjector {
         try pressCommandKey(zoomIn ? 24 : 27)  // = / -
     }
 
+    /// Presses a key with an explicit modifier combination (flags set on the
+    /// events themselves — reliable, unlike separately posted modifier keys).
+    func pressKeyCombo(_ keyCode: CGKeyCode, command: Bool, option: Bool, control: Bool, shift: Bool) throws {
+        var flags: CGEventFlags = []
+        if command { flags.insert(.maskCommand) }
+        if option { flags.insert(.maskAlternate) }
+        if control { flags.insert(.maskControl) }
+        if shift { flags.insert(.maskShift) }
+        guard let down = CGEvent(keyboardEventSource: moveSource, virtualKey: keyCode, keyDown: true),
+              let up = CGEvent(keyboardEventSource: moveSource, virtualKey: keyCode, keyDown: false) else {
+            throw InjectError.eventCreateFailed
+        }
+        down.flags = flags
+        up.flags = flags
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+    }
+
     private func pressCommandKey(_ keyCode: CGKeyCode) throws {
         print("[EventInjector] pressCommandKey keyCode=\(keyCode)")
         let commandFlag: CGEventFlags = .maskCommand
-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true),
-              let up = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else {
+        guard let down = CGEvent(keyboardEventSource: moveSource, virtualKey: keyCode, keyDown: true),
+              let up = CGEvent(keyboardEventSource: moveSource, virtualKey: keyCode, keyDown: false) else {
             throw InjectError.eventCreateFailed
         }
         down.flags = commandFlag
@@ -362,12 +453,17 @@ extension EventInjector {
         var i = 0
         while i < units.count {
             let chunk = Array(units[i..<min(i + chunkSize, units.count)])
-            guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-                  let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+            guard let down = CGEvent(keyboardEventSource: moveSource, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: moveSource, virtualKey: 0, keyDown: false) else {
                 throw InjectError.eventCreateFailed
             }
             down.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
             up.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+            // A latched synthetic modifier (lost key_up) otherwise rides along
+            // and silently turns every typed character into a ⌘/⌃ shortcut —
+            // "the keyboard types nothing" while special keys still work.
+            down.flags = []
+            up.flags = []
             down.post(tap: .cghidEventTap)
             up.post(tap: .cghidEventTap)
             i += chunkSize
@@ -379,8 +475,8 @@ extension EventInjector {
     /// Locks the screen via the system shortcut Ctrl+Cmd+Q.
     private func lockScreen() throws {
         let qKey: CGKeyCode = 12
-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: qKey, keyDown: true),
-              let up = CGEvent(keyboardEventSource: nil, virtualKey: qKey, keyDown: false) else {
+        guard let down = CGEvent(keyboardEventSource: moveSource, virtualKey: qKey, keyDown: true),
+              let up = CGEvent(keyboardEventSource: moveSource, virtualKey: qKey, keyDown: false) else {
             throw InjectError.eventCreateFailed
         }
         let flags: CGEventFlags = [.maskCommand, .maskControl]

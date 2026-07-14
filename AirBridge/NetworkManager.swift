@@ -17,12 +17,16 @@ import VideoToolbox
 import CoreServices
 import AppKit
 import Darwin
+import IOKit.pwr_mgt
 #endif
 
 private final class ConnectionBox {
     var buffer = Data()
     var pendingSecret: Data
     var deviceID: String?   // Added property for deviceID
+    // Last inbound activity; the reaper cancels connections that go silent
+    // (clients heartbeat every 15s, so >40s means the peer is gone).
+    var lastRXAt: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()
     var scrollAccumX: Double = 0
     var scrollAccumY: Double = 0
     // App-layer authentication state. Commands are only executed once the
@@ -104,6 +108,7 @@ final class NetworkManager {
 
     // Video streaming state
     private var videoTimer: DispatchSourceTimer?
+    private var focusPollTimer: DispatchSourceTimer?
     private var videoMaxWidth: Int = 800
     private var videoQuality: Double = 0.6
     private var isSendingFrame = false
@@ -144,6 +149,51 @@ final class NetworkManager {
     }
     #endif
 
+    #if os(macOS)
+    // Display wake: remote input declares user activity so a dark/asleep
+    // display lights up, exactly like touching the physical mouse. Throttled.
+    private var lastUserActivityDeclared: CFAbsoluteTime = 0
+    private var userActivityAssertionID: IOPMAssertionID = 0
+    private func declareUserActivityIfNeeded() {
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastUserActivityDeclared > 5 else { return }
+        lastUserActivityDeclared = now
+        IOPMAssertionDeclareUserActivity("AirPad remote input" as CFString,
+                                         kIOPMUserActiveLocal,
+                                         &userActivityAssertionID)
+    }
+
+    /// MAC address of the primary Ethernet/Wi-Fi interface (en0 preferred),
+    /// shared with the phone for Wake-on-LAN.
+    static func primaryMACAddress() -> String? {
+        var addrs: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&addrs) == 0 else { return nil }
+        defer { freeifaddrs(addrs) }
+        var candidate: String?
+        var ptr = addrs
+        while let p = ptr {
+            let ifa = p.pointee
+            ptr = ifa.ifa_next
+            guard let sa = ifa.ifa_addr, sa.pointee.sa_family == UInt8(AF_LINK) else { continue }
+            let name = String(cString: ifa.ifa_name)
+            let sdl = UnsafeRawPointer(sa).assumingMemoryBound(to: sockaddr_dl.self).pointee
+            guard sdl.sdl_alen == 6 else { continue }
+            let mac: String? = withUnsafeBytes(of: sdl.sdl_data) { raw -> String? in
+                let start = Int(sdl.sdl_nlen)
+                guard raw.count >= start + 6 else { return nil }
+                return (0..<6).map { String(format: "%02x", raw[start + $0]) }
+                    .joined(separator: ":")
+            }
+            guard let mac, mac != "00:00:00:00:00:00" else { continue }
+            if name == "en0" { return mac }
+            if candidate == nil, name.hasPrefix("en") { candidate = mac }
+        }
+        return candidate
+    }
+    #else
+    private func declareUserActivityIfNeeded() {}
+    #endif
+
     // Stable per-Mac identifier so the iPhone can key its per-Mac secret.
     private func machineID() -> String {
         let key = "airbridge.machineID"
@@ -163,8 +213,37 @@ final class NetworkManager {
         }
     }
 
+    /// Tears down and recreates the listener. The Bonjour registration dies
+    /// silently across system sleep — the listener still reports .ready and
+    /// the dashboard says "advertising", but phones can't see the Mac until
+    /// the service is re-registered.
+    func restartAdvertising() {
+        queue.async { [weak self] in
+            guard let self, self.listener != nil else { return }
+            print("[AirBridge] Re-registering Bonjour service")
+            self.listener?.cancel()
+            self.listener = nil
+            for (_, connection) in self.activeConnections { connection.cancel() }
+            self._start()  // metric/reaper timers are recreate-safe
+        }
+    }
+
+    private var wakeObserverInstalled = false
+
     private func _start() {
         startMetricsTimer()
+        startConnectionReaper()
+        #if os(macOS)
+        if !wakeObserverInstalled {
+            wakeObserverInstalled = true
+            // Re-advertise after every wake — the #1 cause of "AirBridge says
+            // advertising but the phone can't find the Mac".
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didWakeNotification, object: nil, queue: nil) { [weak self] _ in
+                self?.restartAdvertising()
+            }
+        }
+        #endif
         // Shared-key TLS-PSK listener (known-working transport). The server-side
         // per-device PSK *selection block* did not complete the TLS handshake in
         // practice, so the channel uses one shared key for encryption and we
@@ -175,7 +254,16 @@ final class NetworkManager {
         params.includePeerToPeer = false
 
         do {
-            let listener = try NWListener(using: params, on: 0)
+            // Fixed port first so "connect by address" (VPN/Tailscale use) has
+            // a stable target across relaunches; fall back to ephemeral if the
+            // port is taken. Bonjour discovery works either way.
+            let listener: NWListener
+            if let port = NWEndpoint.Port(rawValue: 52417),
+               let fixed = try? NWListener(using: params, on: port) {
+                listener = fixed
+            } else {
+                listener = try NWListener(using: params, on: 0)
+            }
             self.listener = listener
             listener.service = NWListener.Service(name: self.machineName(), type: "_airbridge._tcp")
             listener.stateUpdateHandler = { [weak self] state in
@@ -184,7 +272,12 @@ final class NetworkManager {
                     print("[AirBridge] Bonjour advertising _airbridge._tcp and listening")
                     print("[AirBridge] Listener ready on port: \(String(describing: self?.listener?.port))")
                 case .failed(let error):
-                    print("Listener failed: \(error)")
+                    // A failed listener means we're invisible while the UI
+                    // still says "advertising" — recreate it.
+                    print("Listener failed: \(error) — restarting in 2s")
+                    self?.queue.asyncAfter(deadline: .now() + 2) {
+                        self?.restartAdvertising()
+                    }
                 default: break
                 }
             }
@@ -211,11 +304,63 @@ final class NetworkManager {
         print("[AirBridge] Accepted connection: \(connection)")
         // Removed: initial pair_response send on accept per instructions.
 
-        connection.stateUpdateHandler = { state in
-            if case .failed(let error) = state { print("Conn failed: \(error)") }
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let self, let connection else { return }
+            switch state {
+            case .failed(let error):
+                self.teardown(connection, reason: "failed: \(error)")
+            case .cancelled:
+                self.teardown(connection, reason: "cancelled")
+            default:
+                break
+            }
         }
         connection.start(queue: queue)
         receive(on: connection)
+    }
+
+    /// Single, idempotent connection teardown. EVERY exit path must land here:
+    /// a missed teardown leaves the dashboard saying "connected" and — far
+    /// worse — leaves synthetic modifiers/buttons latched, wedging the user's
+    /// physical keyboard and mouse. Runs on `queue`.
+    private func teardown(_ connection: NWConnection, reason: String) {
+        let key = ObjectIdentifier(connection)
+        defer { connection.cancel() }
+        guard let box = connectionBoxes[key] else { return }  // already torn down
+        let deviceID = box.deviceID
+        connectionBoxes.removeValue(forKey: key)
+        activeConnections.removeValue(forKey: key)
+        print("[AirBridge] Connection closed (\(reason))")
+        eventInjector.releaseAllModifiers()
+        stopVideoStream()
+        onDeviceDisconnected(deviceID)
+    }
+
+    /// Releases every synthetic modifier and mouse button — called when the
+    /// app quits so nothing stays latched in the window server after us.
+    func emergencyReleaseInput() {
+        queue.async { [weak self] in self?.eventInjector.releaseAllModifiers() }
+    }
+
+    // Reaps half-open connections: a phone that vanished (Wi-Fi drop, app
+    // killed) never sends a FIN, so without this the dashboard says
+    // "connected" forever and latched input is never released.
+    private var reaperTimer: DispatchSourceTimer?
+    private func startConnectionReaper() {
+        reaperTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 10, repeating: .seconds(10), leeway: .seconds(2))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let now = CFAbsoluteTimeGetCurrent()
+            for (key, connection) in self.activeConnections {
+                if let box = self.connectionBoxes[key], now - box.lastRXAt > 40 {
+                    self.teardown(connection, reason: "inactivity (\(Int(now - box.lastRXAt))s)")
+                }
+            }
+        }
+        timer.resume()
+        reaperTimer = timer
     }
 
     private func receive(on connection: NWConnection) {
@@ -224,6 +369,7 @@ final class NetworkManager {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
             guard let self else { return }
             if let data, !data.isEmpty {
+                box.lastRXAt = CFAbsoluteTimeGetCurrent()
                 box.buffer.append(data)
                 // Process complete lines (\n-delimited)
                 while let newlineIndex = box.buffer.firstIndex(of: 0x0A) { // 0x0A = \n
@@ -234,15 +380,7 @@ final class NetworkManager {
                 }
             }
             if isComplete || error != nil {
-                let deviceID = box.deviceID
-                self.connectionBoxes.removeValue(forKey: key)
-                self.activeConnections.removeValue(forKey: key)
-                self.onDeviceDisconnected(deviceID)
-                // Safety: a dropped connection must not leave synthetic modifier
-                // keys latched (a stuck Ctrl turns every left click into a right
-                // click system-wide).
-                self.eventInjector.releaseAllModifiers()
-                connection.cancel()
+                self.teardown(connection, reason: error.map { "receive error: \($0)" } ?? "stream complete")
                 return
             }
             self.receive(on: connection)
@@ -251,15 +389,18 @@ final class NetworkManager {
 
     // High-rate input types arrive up to ~120/s; logging each one adds real
     // latency to the event path, so they are excluded from RX logging.
-    private static let quietTypes: Set<String> = ["mouse_move", "scroll"]
+    private static let quietTypes: Set<String> = ["mouse_move", "mouse_move_abs", "scroll"]
 
     // Message types suppressed by "Pause Input".
     private static let inputTypes: Set<String> = [
-        "mouse_move", "scroll", "mouse_click", "mouse_down", "mouse_up",
-        "key_down", "key_up", "swipe", "action", "nav", "pinch", "media", "type_text"
+        "mouse_move", "mouse_move_abs", "scroll", "mouse_click", "mouse_down", "mouse_up",
+        "key_down", "key_up", "key_combo", "swipe", "action", "nav", "pinch", "media", "type_text"
     ]
     // Written on `queue` via setInputPaused; read on `queue` in handleLine.
     private var inputPaused = false
+    // Last known "focus is in a text field" state (queue-confined), so the
+    // phone is only notified on changes.
+    var lastTextFocusState = false
 
     /// Thread-safe toggle for suppressing input injection (menu bar / window).
     func setInputPaused(_ paused: Bool) {
@@ -362,8 +503,14 @@ final class NetworkManager {
             // challenge-response below. Only handshake messages are allowed
             // before authentication, so an unauthenticated peer can neither
             // inject input nor read system/app information.
-            let openTypes: Set<String> = ["hello", "pair_request", "auth_proof"]
+            let openTypes: Set<String> = ["hello", "pair_request", "auth_proof", "bye"]
             if !openTypes.contains(type) && !box.authenticated {
+                return
+            }
+            // Explicit goodbye from the phone's Disconnect button: tear down
+            // NOW instead of waiting for the socket to die on its own.
+            if type == "bye" {
+                self.teardown(connection, reason: "client said bye")
                 return
             }
             // User-controlled "Pause Input": drop injection messages while
@@ -376,6 +523,9 @@ final class NetworkManager {
             if Self.inputTypes.contains(type) {
                 eventsInWindow += 1
                 if let id = box.deviceID { perDeviceTotals[id, default: 0] += 1 }
+                // Remote input counts as user activity: wakes a sleeping
+                // display exactly like touching the physical mouse would.
+                self.declareUserActivityIfNeeded()
             }
             switch type {
             case "hello":
@@ -387,9 +537,16 @@ final class NetworkManager {
                     }
                     // Tell the client which Mac this is so it can select/store the
                     // matching per-device key (enables one iPhone <-> many Macs).
+                    self.lastTextFocusState = false  // fresh connection, fresh focus tracking
+                    var serverInfo: [String: Any] = ["macID": self.machineID(), "macName": self.machineName()]
+                    #if os(macOS)
+                    // Hardware address lets the phone send Wake-on-LAN packets
+                    // when this Mac is asleep (needs "Wake for network access").
+                    if let mac = Self.primaryMACAddress() { serverInfo["macAddress"] = mac }
+                    #endif
                     self.sendLine(connection, jsonObject: [
                         "type": "server_info",
-                        "payload": ["macID": self.machineID(), "macName": self.machineName()]
+                        "payload": serverInfo
                     ])
                     // QR pairing: if the hello carries a proof of the currently
                     // displayed QR secret, pair without any approval dialog —
@@ -509,7 +666,34 @@ final class NetworkManager {
                 // Convenience that performs down+up using eventInjector.clickMouse(kind:)
                 if let payload = dict["payload"] as? [String: Any], let button = payload["button"] as? String {
                     let kind: MouseClickKind = (button == "right" ? .right : button == "middle" ? .middle : .left)
-                    try? self.eventInjector.clickMouse(kind: kind)
+                    let count = (payload["count"] as? Int) ?? Int(payload["count"] as? Double ?? 1)
+                    try? self.eventInjector.clickMouse(kind: kind, count: count)
+                    // After a left click, check whether a text field took focus
+                    // so the phone can raise its keyboard automatically. Twice:
+                    // browsers/electron apps update AX focus noticeably late.
+                    if kind == .left {
+                        self.checkTextFieldFocus(after: 0.25, connection: connection)
+                        self.checkTextFieldFocus(after: 1.0, connection: connection)
+                    }
+                }
+            case "key_combo":
+                // A key with explicit modifiers (keyboard accessory bar shortcuts).
+                if let payload = dict["payload"] as? [String: Any] {
+                    let keyCode = (payload["keyCode"] as? Int) ?? Int(payload["keyCode"] as? Double ?? -1)
+                    if keyCode >= 0 {
+                        try? self.eventInjector.pressKeyCombo(
+                            CGKeyCode(keyCode),
+                            command: payload["command"] as? Bool ?? false,
+                            option: payload["option"] as? Bool ?? false,
+                            control: payload["control"] as? Bool ?? false,
+                            shift: payload["shift"] as? Bool ?? false)
+                    }
+                }
+            case "mouse_move_abs":
+                // Absolute, display-normalized cursor position (Live Screen touch).
+                if let payload = dict["payload"] as? [String: Any],
+                   let x = payload["x"] as? Double, let y = payload["y"] as? Double {
+                    try? self.eventInjector.moveMouseAbsolute(nx: x, ny: y)
                 }
             case "move", "mouse_move", "cursor_move", "air_mouse":
                 if let payload = dict["payload"] as? [String: Any] {
@@ -608,6 +792,25 @@ final class NetworkManager {
                     try? self.eventInjector.handleMedia(action: action)
                 }
                 #endif
+            case "now_playing_get":
+                // Current track (Music/Spotify) + system volume for the phone's
+                // media screen. NSAppleScript must run on the main thread.
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    let payload = self.fetchNowPlaying()
+                    self.queue.async {
+                        self.sendLine(connection, jsonObject: ["type": "now_playing", "payload": payload])
+                    }
+                }
+            case "set_volume":
+                if let payload = dict["payload"] as? [String: Any] {
+                    let level = (payload["level"] as? Int) ?? Int(payload["level"] as? Double ?? -1)
+                    if (0...100).contains(level) {
+                        DispatchQueue.main.async { [weak self] in
+                            _ = self?.runAppleScript("set volume output volume \(level)")
+                        }
+                    }
+                }
             case "type_text":
                 // Types a whole string on the Mac (dictation, clipboard paste-through).
                 if let payload = dict["payload"] as? [String: Any], let text = payload["text"] as? String {
@@ -668,6 +871,17 @@ final class NetworkManager {
                     else if let maxWD = payload["maxWidth"] as? Double { self.videoMaxWidth = Int(maxWD) }
                     if let q = payload["quality"] as? Double { self.videoQuality = max(0.1, min(1.0, q)) }
                 }
+                #if os(macOS)
+                // Without Screen Recording permission, capture fails silently and
+                // the phone shows "no frames" forever. Tell it why.
+                if !CGPreflightScreenCaptureAccess() {
+                    _ = CGRequestScreenCaptureAccess()  // prompts / adds AirBridge to the list once
+                    self.sendLine(connection, jsonObject: [
+                        "type": "stream_error",
+                        "payload": ["reason": "screen_recording_permission"]
+                    ])
+                }
+                #endif
                 self.startVideoStream(to: connection)
             case "video_stop":
                 self.stopVideoStream()
@@ -961,6 +1175,25 @@ final class NetworkManager {
                 self.sendError("request_desktops not supported on this platform", to: connection)
                 #endif
 
+            case "request_desktop_previews":
+                #if os(macOS)
+                let previewWidth: Int = {
+                    if let p = dict["payload"] as? [String: Any] {
+                        if let v = p["maxWidth"] as? Int { return v }
+                        if let v = p["maxWidth"] as? Double { return Int(v) }
+                    }
+                    return 280
+                }()
+                if CGPreflightScreenCaptureAccess() {
+                    Task.detached { [weak self, weak connection] in
+                        guard let self, let connection else { return }
+                        await self._sendDesktopPreviews(to: connection, maxWidth: previewWidth)
+                    }
+                } else {
+                    self.sendError("desktop_previews: screen recording permission missing", to: connection)
+                }
+                #endif
+
             case "focus_desktop":
                 #if os(macOS)
                 if let payload = dict["payload"] as? [String: Any], let id = payload["id"] as? String {
@@ -1142,6 +1375,10 @@ final class NetworkManager {
 
     private func startVideoStream(to connection: NWConnection) {
         stopVideoStream()
+        // Re-announce keyboard focus from scratch on every new stream: a stale
+        // "already focused" state otherwise suppresses the text_focus event the
+        // phone needs to auto-raise its keyboard.
+        lastTextFocusState = false
         #if os(macOS)
         if screenCapture == nil {
             let helper = ScreenCaptureHelper()
@@ -1175,11 +1412,33 @@ final class NetworkManager {
         }
         timer.resume()
         self.videoTimer = timer
+
+        // While the phone is watching the screen, poll keyboard focus so its
+        // keyboard rises even when focus changed without a phone click (Tab
+        // key, Spotlight, a dialog opening, the real mouse...). Click-driven
+        // detection alone misses all of those.
+        let focusTimer = DispatchSource.makeTimerSource(queue: queue)
+        focusTimer.schedule(deadline: .now() + 1, repeating: .seconds(1), leeway: .milliseconds(200))
+        focusTimer.setEventHandler { [weak self, weak connection] in
+            guard let self, let connection else { return }
+            let focused = Self.focusedElementIsTextInput()
+            if focused != self.lastTextFocusState {
+                self.lastTextFocusState = focused
+                self.sendLine(connection, jsonObject: [
+                    "type": "text_focus",
+                    "payload": ["focused": focused]
+                ])
+            }
+        }
+        focusTimer.resume()
+        self.focusPollTimer = focusTimer
     }
 
     private func stopVideoStream() {
         videoTimer?.cancel()
         videoTimer = nil
+        focusPollTimer?.cancel()
+        focusPollTimer = nil
         isSendingFrame = false
         #if os(macOS)
         screenCapture?.stop()
@@ -1360,6 +1619,116 @@ private extension NetworkManager {
         }
     }
 
+    /// After a click, checks (via Accessibility) whether keyboard focus landed
+    /// on a text field and notifies the phone on CHANGES so it can raise or
+    /// lower its keyboard automatically.
+    func checkTextFieldFocus(after delay: TimeInterval, connection: NWConnection) {
+        queue.asyncAfter(deadline: .now() + delay) { [weak self, weak connection] in
+            guard let self, let connection else { return }
+            let focused = Self.focusedElementIsTextInput()
+            self.lastTextFocusState = focused
+            // Click-driven checks send UNCONDITIONALLY: change-gating here
+            // proved fragile (a stale "already focused" suppressed the event
+            // the phone needed). Repeats are idempotent on the client.
+            self.sendLine(connection, jsonObject: [
+                "type": "text_focus",
+                "payload": ["focused": focused]
+            ])
+        }
+    }
+
+    private static func focusedElementIsTextInput() -> Bool {
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
+              let focusedRaw = focusedRef, CFGetTypeID(focusedRaw) == AXUIElementGetTypeID() else { return false }
+        let element = unsafeDowncast(focusedRaw as AnyObject, to: AXUIElement.self)
+        var roleRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success,
+              let role = roleRef as? String else { return false }
+        let textRoles: Set<String> = [
+            kAXTextFieldRole as String, kAXTextAreaRole as String,
+            kAXComboBoxRole as String, "AXSearchField", "AXSecureTextField"
+        ]
+        if textRoles.contains(role) { return true }
+
+        // Subrole catches search/secure fields exposed under a generic role.
+        var subroleRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &subroleRef) == .success,
+           let subrole = subroleRef as? String,
+           ["AXSearchField", "AXSecureTextField", "AXTextInput"].contains(subrole) {
+            return true
+        }
+
+        // Web content (browsers) often exposes editable areas as AXWebArea/other
+        // roles but sets the focused element's AXRoleDescription or supports
+        // AXSelectedText editing; a pragmatic extra check:
+        var editableRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, "AXEditableAncestor" as CFString, &editableRef) == .success,
+           editableRef != nil {
+            return true
+        }
+
+        // Last resort for web/electron apps: a focused element whose VALUE is
+        // settable is a text input in practice (buttons/links aren't settable).
+        var settable = DarwinBoolean(false)
+        if AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success,
+           settable.boolValue,
+           role != "AXCheckBox", role != "AXRadioButton", role != "AXSlider",
+           role != "AXPopUpButton", role != "AXMenuItem", role != "AXIncrementor" {
+            return true
+        }
+        return false
+    }
+
+    /// Runs an AppleScript snippet; MUST be called on the main thread.
+    func runAppleScript(_ source: String) -> NSAppleEventDescriptor? {
+        var error: NSDictionary?
+        let result = NSAppleScript(source: source)?.executeAndReturnError(&error)
+        if let error {
+            print("[NetworkManager] AppleScript error: \(error[NSAppleScript.errorBriefMessage] ?? error)")
+            return nil
+        }
+        return result
+    }
+
+    /// Current track from Music or Spotify (whichever is playing) + system
+    /// volume. Main thread only. First use prompts the user to allow AirBridge
+    /// to control Music/Spotify (Automation permission).
+    func fetchNowPlaying() -> [String: Any] {
+        var payload: [String: Any] = ["playing": false]
+
+        if let vol = runAppleScript("output volume of (get volume settings)") {
+            payload["volume"] = Int(vol.int32Value)
+        }
+        if let muted = runAppleScript("output muted of (get volume settings)") {
+            payload["muted"] = muted.booleanValue
+        }
+
+        for app in ["Music", "Spotify"] {
+            let script = """
+            if application "\(app)" is running then
+                tell application "\(app)"
+                    if player state is playing then
+                        return (name of current track) & "\u{0001}" & (artist of current track)
+                    end if
+                end tell
+            end if
+            return ""
+            """
+            if let result = runAppleScript(script),
+               let string = result.stringValue, !string.isEmpty {
+                let parts = string.components(separatedBy: "\u{0001}")
+                payload["playing"] = true
+                payload["title"] = parts.first ?? ""
+                payload["artist"] = parts.count > 1 ? parts[1] : ""
+                payload["app"] = app
+                break
+            }
+        }
+        return payload
+    }
+
     func _enumerateOpenWindows() throws -> [[String: Any]] {
         guard let windowInfo = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else { return [] }
         let spaceMap = _buildWindowToSpaceIndexMap()
@@ -1471,6 +1840,164 @@ private extension NetworkManager {
             }
         }
         return mapping
+    }
+
+    /// Composites a miniature of every desktop from per-window screenshots and
+    /// streams them to the phone as individual "desktop_preview" messages.
+    /// SCContentFilter(desktopIndependentWindow:) can image a window no matter
+    /// which Space it lives on — the only way to preview non-current desktops.
+    func _sendDesktopPreviews(to connection: NWConnection, maxWidth: Int) async {
+        guard let desktops = try? _enumerateDesktops(), !desktops.isEmpty,
+              let winInfo = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else { return }
+        let spaceMap = _buildWindowToSpaceIndexMap()
+        // If shareable-content enumeration fails we still send previews —
+        // silhouettes only. Aborting here left the phone with nothing at all.
+        let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        let scByID = Dictionary((content?.windows ?? []).map { (Int($0.windowID), $0) },
+                                uniquingKeysWith: { a, _ in a })
+
+        let screen = NSScreen.main?.frame ?? CGRect(x: 0, y: 0, width: 1728, height: 1117)
+        guard screen.width > 0 else { return }
+        let scale = CGFloat(maxWidth) / screen.width
+        let canvasW = maxWidth
+        let canvasH = max(1, Int(screen.height * scale))
+
+        struct Entry { let id: Int; let bounds: CGRect; let space: Int; let app: String }
+        var entries: [Entry] = []
+        for w in winInfo {
+            guard (w[kCGWindowLayer as String] as? Int ?? 0) == 0,
+                  let num = w[kCGWindowNumber as String] as? Int,
+                  let space = spaceMap[num],
+                  let bDict = w[kCGWindowBounds as String] as? NSDictionary,
+                  let b = CGRect(dictionaryRepresentation: bDict),
+                  b.width > 40, b.height > 40 else { continue }
+            let app = w[kCGWindowOwnerName as String] as? String ?? "?"
+            entries.append(Entry(id: num, bounds: b, space: space, app: app))
+        }
+
+        // The CURRENT desktop gets a real full-screen shot — the same capture
+        // path the live stream uses, which is known-good. Per-window captures
+        // (needed for other Spaces) are unreliable for off-Space windows on
+        // recent macOS and often come back black; those get validated and fall
+        // back to colored window silhouettes so a preview is never just black.
+        let currentIdx = _currentDesktopIndex(from: desktops)
+        let fullShot = _captureDisplayOnce()
+
+        var captureCache: [Int: CGImage] = [:]
+        var capturesLeft = 24  // total screenshot budget per refresh
+
+        for d in desktops {
+            guard let idx = d["index"] as? Int, let id = d["id"] as? String else { continue }
+            // CGWindowList is front-to-back; keep the frontmost few, draw reversed.
+            let wins = Array(entries.filter { $0.space == idx }.prefix(8))
+            guard let ctx = CGContext(data: nil, width: canvasW, height: canvasH,
+                                      bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue) else { continue }
+            ctx.setFillColor(CGColor(red: 0.17, green: 0.18, blue: 0.23, alpha: 1))
+            ctx.fill(CGRect(x: 0, y: 0, width: CGFloat(canvasW), height: CGFloat(canvasH)))
+
+            if idx == currentIdx, let shot = fullShot {
+                ctx.draw(shot, in: CGRect(x: 0, y: 0, width: CGFloat(canvasW), height: CGFloat(canvasH)))
+            } else {
+                for e in wins.reversed() {
+                    var img = captureCache[e.id]
+                    if img == nil, capturesLeft > 0, let sc = scByID[e.id] {
+                        capturesLeft -= 1
+                        let cfg = SCStreamConfiguration()
+                        cfg.width = max(2, Int(e.bounds.width * scale * 2))   // 2x for crispness
+                        cfg.height = max(2, Int(e.bounds.height * scale * 2))
+                        cfg.showsCursor = false
+                        let filter = SCContentFilter(desktopIndependentWindow: sc)
+                        if let captured = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg),
+                           !Self._isMostlyBlack(captured) {
+                            img = captured
+                            captureCache[e.id] = captured
+                        }
+                    }
+                    // CGWindow bounds are top-left origin; CGContext is bottom-left.
+                    let r = CGRect(x: e.bounds.minX * scale,
+                                   y: CGFloat(canvasH) - e.bounds.maxY * scale,
+                                   width: e.bounds.width * scale,
+                                   height: e.bounds.height * scale)
+                    if let img {
+                        ctx.draw(img, in: r)
+                    } else {
+                        Self._drawWindowSilhouette(ctx, rect: r, appName: e.app)
+                    }
+                }
+            }
+
+            guard let composed = ctx.makeImage(),
+                  let jpeg = self.jpegData(from: composed, maxWidth: maxWidth, quality: 0.7) else { continue }
+            self.sendLine(connection, jsonObject: [
+                "type": "desktop_preview",
+                "payload": ["id": id, "data": jpeg.base64EncodedString()]
+            ])
+        }
+    }
+
+    /// One frame of the main display: the live stream's latest frame when
+    /// streaming, else a one-shot ScreenCaptureKit capture (≤1s).
+    private func _captureDisplayOnce() -> CGImage? {
+        if let live = latestCapturedImage { return live }
+
+        final class OneShotConsumer: ScreenFrameConsumer {
+            let sema: DispatchSemaphore
+            var image: CGImage?
+            init(sema: DispatchSemaphore) { self.sema = sema }
+            func didProduceFrame(_ image: CGImage) {
+                if self.image == nil { self.image = image; sema.signal() }
+            }
+        }
+        let sema = DispatchSemaphore(value: 0)
+        let helper = ScreenCaptureHelper()
+        let consumer = OneShotConsumer(sema: sema)
+        helper.consumer = consumer
+        Task {
+            do { try await helper.start() } catch { sema.signal() }
+        }
+        let waitResult = sema.wait(timeout: .now() + 1.0)
+        helper.stop()
+        guard waitResult == .success else { return nil }
+        return consumer.image
+    }
+
+    /// True when an image is essentially black (failed off-Space capture).
+    private static func _isMostlyBlack(_ image: CGImage) -> Bool {
+        let w = 8, h = 8
+        guard let ctx = CGContext(data: nil, width: w, height: h,
+                                  bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        guard let data = ctx.data else { return false }
+        let buf = data.bindMemory(to: UInt8.self, capacity: w * h * 4)
+        var total = 0
+        for i in 0..<(w * h) {
+            total += Int(buf[i * 4]) + Int(buf[i * 4 + 1]) + Int(buf[i * 4 + 2])
+        }
+        return total < (w * h * 3) * 10  // average channel value under 10/255
+    }
+
+    /// Mission-Control-style stand-in when a window can't be imaged: a rounded
+    /// card tinted per app, with a title-bar strip. Stable color per app name.
+    private static func _drawWindowSilhouette(_ ctx: CGContext, rect: CGRect, appName: String) {
+        let hash = appName.unicodeScalars.reduce(0) { ($0 &* 31 &+ Int($1.value)) & 0x7FFFFFFF }
+        let hue = CGFloat(hash % 360) / 360
+        let color = NSColor(hue: hue, saturation: 0.42, brightness: 0.58, alpha: 1)
+        let path = CGPath(roundedRect: rect, cornerWidth: 3, cornerHeight: 3, transform: nil)
+        ctx.setFillColor(color.cgColor)
+        ctx.addPath(path)
+        ctx.fillPath()
+        // Title-bar strip along the window's top edge (context is bottom-left).
+        let bar = CGRect(x: rect.minX, y: max(rect.minY, rect.maxY - 4), width: rect.width, height: 4)
+        ctx.setFillColor(CGColor(gray: 1, alpha: 0.3))
+        ctx.fill(bar)
+        ctx.setStrokeColor(CGColor(gray: 1, alpha: 0.35))
+        ctx.setLineWidth(1)
+        ctx.addPath(path)
+        ctx.strokePath()
     }
 
     func _windowImage(windowNumber: Int) -> CGImage? {
