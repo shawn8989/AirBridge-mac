@@ -401,6 +401,10 @@ final class NetworkManager {
     // Last known "focus is in a text field" state (queue-confined), so the
     // phone is only notified on changes.
     var lastTextFocusState = false
+    // Last focus diagnostic logged to the Activity tab (queue-confined).
+    var lastFocusDetail: String = ""
+    // Cached desktop-preview screenshots per Space id (queue-confined).
+    var desktopSnapshots: [String: Data] = [:]
 
     /// Thread-safe toggle for suppressing input injection (menu bar / window).
     func setInputPaused(_ paused: Bool) {
@@ -1638,10 +1642,6 @@ private extension NetworkManager {
     /// After a click, checks (via Accessibility) whether keyboard focus landed
     /// on a text field and notifies the phone on CHANGES so it can raise or
     /// lower its keyboard automatically.
-    // Last diagnostic we logged (queue-confined), so the Activity tab shows
-    // focus-detection results only when they change instead of per click.
-    private var lastFocusDetail: String = ""
-
     func checkTextFieldFocus(after delay: TimeInterval, connection: NWConnection) {
         queue.asyncAfter(deadline: .now() + delay) { [weak self, weak connection] in
             guard let self, let connection else { return }
@@ -1914,8 +1914,8 @@ private extension NetworkManager {
     // phone-driven switch) we snapshot the full display — the proven capture
     // path — and cache it. Per-window captures of OTHER Spaces routinely come
     // back black on modern macOS, so they're only a fallback for desktops the
-    // user hasn't visited yet this session.
-    private var desktopSnapshots: [String: Data] = [:]  // space id -> JPEG (queue-confined)
+    // user hasn't visited yet this session. (Storage lives in the main class
+    // body — desktopSnapshots — since extensions can't hold stored properties.)
 
     /// Captures the current desktop and caches its preview JPEG. Blocking ≤2.5s.
     func _snapshotCurrentDesktop(maxWidth: Int) {
