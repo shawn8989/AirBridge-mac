@@ -542,6 +542,13 @@ final class NetworkManager {
                     // Tell the client which Mac this is so it can select/store the
                     // matching per-device key (enables one iPhone <-> many Macs).
                     self.lastTextFocusState = false  // fresh connection, fresh focus tracking
+                    #if os(macOS)
+                    // Warm SkyLight's Spaces data so the first desktops request
+                    // isn't served a partial list.
+                    DispatchQueue.global(qos: .utility).async { [weak self] in
+                        _ = try? self?._enumerateDesktops()
+                    }
+                    #endif
                     var serverInfo: [String: Any] = ["macID": self.machineID(), "macName": self.machineName()]
                     #if os(macOS)
                     // Hardware address lets the phone send Wake-on-LAN packets
@@ -1163,7 +1170,16 @@ final class NetworkManager {
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                     guard let self else { return }
                     do {
-                        let desktops = try self._enumerateDesktops()
+                        var desktops = try self._enumerateDesktops()
+                        // SkyLight's space list is often partial for the first
+                        // seconds after connect ("only 1 desktop"). If it looks
+                        // thin, give it a moment and ask again before replying.
+                        if desktops.count <= 1 {
+                            Thread.sleep(forTimeInterval: 1.0)
+                            if let retried = try? self._enumerateDesktops(), retried.count > desktops.count {
+                                desktops = retried
+                            }
+                        }
                         var payloadObj: [String: Any] = ["desktops": desktops]
                         if let currentIdx = self._currentDesktopIndex(from: desktops) { payloadObj["current_desktop_index"] = currentIdx }
                         let response: [String: Any] = [
@@ -1213,13 +1229,15 @@ final class NetworkManager {
                             // a genuine screenshot in the switcher.
                             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.8) { [weak self, weak connection] in
                                 guard let self else { return }
-                                self._snapshotCurrentDesktop(maxWidth: 280)
-                                guard let connection else { return }
+                                // Push under the id WE computed for the space
+                                // we actually landed on — not the client-sent
+                                // id, which can be stale.
+                                guard let snap = self._snapshotCurrentDesktop(maxWidth: 280),
+                                      let connection else { return }
                                 self.queue.async { [weak self] in
-                                    guard let self, let jpeg = self.desktopSnapshots[id] else { return }
-                                    self.sendLine(connection, jsonObject: [
+                                    self?.sendLine(connection, jsonObject: [
                                         "type": "desktop_preview",
-                                        "payload": ["id": id, "data": jpeg.base64EncodedString()]
+                                        "payload": ["id": snap.id, "data": snap.jpeg.base64EncodedString()]
                                     ])
                                 }
                             }
@@ -1549,8 +1567,15 @@ private extension NetworkManager {
             var msid: Int?
             if let n = s["ManagedSpaceID"] as? NSNumber { msid = n.intValue } else if let n = s["ManagedSpaceID"] as? Int { msid = n }
             let isActive = (currentUUID != nil && uuid == currentUUID) || (currentMSID != nil && msid != nil && currentMSID == msid)
+            // STABLE id: prefer the ManagedSpaceID number. SkyLight sometimes
+            // omits uuids right after connect and fills them in later — if the
+            // id flips from the fallback to the uuid between fetches, every
+            // preview cached under the old id orphans ("preview stopped
+            // working"). The msid is present consistently; _focusDesktop
+            // already matches either form.
+            let stableID = msid.map(String.init) ?? uuid
             var obj: [String: Any] = [
-                "id": uuid,
+                "id": stableID,
                 "index": idx + 1,
                 "isActive": isActive
             ]
@@ -1918,14 +1943,17 @@ private extension NetworkManager {
     // body — desktopSnapshots — since extensions can't hold stored properties.)
 
     /// Captures the current desktop and caches its preview JPEG. Blocking ≤2.5s.
-    func _snapshotCurrentDesktop(maxWidth: Int) {
+    /// Returns the (space id, jpeg) it cached so callers can push it directly.
+    @discardableResult
+    func _snapshotCurrentDesktop(maxWidth: Int) -> (id: String, jpeg: Data)? {
         guard let desktops = try? _enumerateDesktops(),
               let currentIdx = _currentDesktopIndex(from: desktops),
               let currentID = desktops.first(where: { ($0["index"] as? Int) == currentIdx })?["id"] as? String,
               let shot = _captureDisplayOnce(),
               let jpeg = jpegData(from: shot, maxWidth: maxWidth, quality: 0.7)
-        else { return }
+        else { return nil }
         queue.async { [weak self] in self?.desktopSnapshots[currentID] = jpeg }
+        return (currentID, jpeg)
     }
 
     /// Streams one "desktop_preview" message per desktop: the cached real
