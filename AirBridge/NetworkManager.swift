@@ -1596,14 +1596,19 @@ private extension NetworkManager {
             // working"). The msid is present consistently; _focusDesktop
             // already matches either form.
             let stableID = msid.map(String.init) ?? uuid
-            // Space type 4 = a full-screen app's Space (macOS models them as
-            // desktops); regular user desktops are type 0.
+            // Full-screen-app Spaces are detected on THREE signals — the
+            // classic type==4 alone doesn't match on every macOS build:
+            // they also carry a tile-layout manager and an owning app pid,
+            // which regular user desktops never do.
             let spaceType = (s["type"] as? NSNumber)?.intValue ?? (s["type"] as? Int ?? 0)
+            let isFullscreen = spaceType == 4
+                || s["TileLayoutManager"] != nil
+                || s["pid"] != nil
             var obj: [String: Any] = [
                 "id": stableID,
                 "index": idx + 1,
                 "isActive": isActive,
-                "isFullscreen": spaceType == 4
+                "isFullscreen": isFullscreen
             ]
             if let name = name { obj["name"] = name }
             result.append(obj)
@@ -1667,10 +1672,25 @@ private extension NetworkManager {
             // No wrap-around: stay put at the edges, matching native behavior.
             guard let target, let id = target["id"] as? String else {
                 print("[NetworkManager] switchSpace: no eligible Space beyond index \(current) (have \(desktops.count))")
+                if skipFullscreen {
+                    emitActivity("rectangle.righthalf.inset.filled.arrow.right",
+                                 "No regular desktop \(offset > 0 ? "to the right" : "to the left") of \(current) — only full-screen apps")
+                }
                 return
             }
             try _focusDesktop(id: id)
             print("[NetworkManager] switchSpace -> index \(targetIndex)\(skipFullscreen ? " (skipping full-screen apps)" : "")")
+            if skipFullscreen {
+                // Diagnostic breadcrumb: shows exactly what the hop saw, so a
+                // misdetected space type is visible in the Activity tab.
+                let kinds = desktops.map { d -> String in
+                    let i = d["index"] as? Int ?? 0
+                    let fs = (d["isFullscreen"] as? Bool) ?? false
+                    return "\(i)\(fs ? "F" : "D")"
+                }.joined(separator: " ")
+                emitActivity("rectangle.righthalf.inset.filled.arrow.right",
+                             "Desktop hop \(current)→\(targetIndex) [\(kinds)]")
+            }
         } catch {
             // SkyLight unavailable; fall back to the keyboard shortcut.
             print("[NetworkManager] switchSpace falling back to Ctrl+Arrow: \(error)")
