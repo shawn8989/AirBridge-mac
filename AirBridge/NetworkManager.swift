@@ -766,8 +766,11 @@ final class NetworkManager {
                         // depend on the Mission Control keyboard shortcuts being
                         // enabled and is far more reliable than posted key events.
                         case "left", "right":
+                            let skipFS = (payload["skipFullscreen"] as? Bool) ?? false
                             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                                self?.switchSpace(offset: direction == "right" ? 1 : -1, fallbackFingers: fingers)
+                                self?.switchSpace(offset: direction == "right" ? 1 : -1,
+                                                  fallbackFingers: fingers,
+                                                  skipFullscreen: skipFS)
                             }
                         // Up/down open Mission Control / App Exposé by launching
                         // Mission Control.app directly — synthetic Ctrl+Arrow is
@@ -1593,10 +1596,14 @@ private extension NetworkManager {
             // working"). The msid is present consistently; _focusDesktop
             // already matches either form.
             let stableID = msid.map(String.init) ?? uuid
+            // Space type 4 = a full-screen app's Space (macOS models them as
+            // desktops); regular user desktops are type 0.
+            let spaceType = (s["type"] as? NSNumber)?.intValue ?? (s["type"] as? Int ?? 0)
             var obj: [String: Any] = [
                 "id": stableID,
                 "index": idx + 1,
-                "isActive": isActive
+                "isActive": isActive,
+                "isFullscreen": spaceType == 4
             ]
             if let name = name { obj["name"] = name }
             result.append(obj)
@@ -1637,21 +1644,33 @@ private extension NetworkManager {
     /// right) using SkyLight directly, so it works regardless of the Mission
     /// Control keyboard-shortcut settings. Falls back to a synthetic Ctrl+Arrow
     /// only if the private API is unavailable.
-    func switchSpace(offset: Int, fallbackFingers: Int) {
+    func switchSpace(offset: Int, fallbackFingers: Int, skipFullscreen: Bool = false) {
         do {
             let desktops = try _enumerateDesktops()
             guard !desktops.isEmpty else { throw AirBridgeError.spacesUnavailable }
             guard let current = _currentDesktopIndex(from: desktops) else { throw AirBridgeError.spaceNotFound }
-            let targetIndex = current + offset
+            // Walk in the requested direction; with skipFullscreen, hop over
+            // full-screen-app Spaces so the Desktop buttons land on real
+            // desktops instead of cycling through every maximized app.
+            let step = offset > 0 ? 1 : -1
+            var targetIndex = current + step
+            var target: [String: Any]?
+            while targetIndex >= 1 && targetIndex <= desktops.count {
+                let candidate = desktops.first(where: { ($0["index"] as? Int) == targetIndex })
+                let isFS = (candidate?["isFullscreen"] as? Bool) ?? false
+                if candidate != nil && (!skipFullscreen || !isFS) {
+                    target = candidate
+                    break
+                }
+                targetIndex += step
+            }
             // No wrap-around: stay put at the edges, matching native behavior.
-            guard targetIndex >= 1, targetIndex <= desktops.count,
-                  let target = desktops.first(where: { ($0["index"] as? Int) == targetIndex }),
-                  let id = target["id"] as? String else {
-                print("[NetworkManager] switchSpace: no Space at index \(targetIndex) (have \(desktops.count))")
+            guard let target, let id = target["id"] as? String else {
+                print("[NetworkManager] switchSpace: no eligible Space beyond index \(current) (have \(desktops.count))")
                 return
             }
             try _focusDesktop(id: id)
-            print("[NetworkManager] switchSpace -> index \(targetIndex)")
+            print("[NetworkManager] switchSpace -> index \(targetIndex)\(skipFullscreen ? " (skipping full-screen apps)" : "")")
         } catch {
             // SkyLight unavailable; fall back to the keyboard shortcut.
             print("[NetworkManager] switchSpace falling back to Ctrl+Arrow: \(error)")
