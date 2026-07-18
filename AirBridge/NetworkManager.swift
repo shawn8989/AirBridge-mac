@@ -401,6 +401,13 @@ final class NetworkManager {
     // Last known "focus is in a text field" state (queue-confined), so the
     // phone is only notified on changes.
     var lastTextFocusState = false
+    // Last focus diagnostic logged to the Activity tab (queue-confined).
+    var lastFocusDetail: String = ""
+    // Cached desktop-preview screenshots per Space id (queue-confined).
+    var desktopSnapshots: [String: Data] = [:]
+    // Coalesces preview refreshes: the client fires several in quick
+    // succession and each spun up its own capture stream (queue-confined).
+    var previewsInFlight = false
 
     /// Thread-safe toggle for suppressing input injection (menu bar / window).
     func setInputPaused(_ paused: Bool) {
@@ -538,6 +545,13 @@ final class NetworkManager {
                     // Tell the client which Mac this is so it can select/store the
                     // matching per-device key (enables one iPhone <-> many Macs).
                     self.lastTextFocusState = false  // fresh connection, fresh focus tracking
+                    #if os(macOS)
+                    // Warm SkyLight's Spaces data so the first desktops request
+                    // isn't served a partial list.
+                    DispatchQueue.global(qos: .utility).async { [weak self] in
+                        _ = try? self?._enumerateDesktops()
+                    }
+                    #endif
                     var serverInfo: [String: Any] = ["macID": self.machineID(), "macName": self.machineName()]
                     #if os(macOS)
                     // Hardware address lets the phone send Wake-on-LAN packets
@@ -1159,7 +1173,16 @@ final class NetworkManager {
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                     guard let self else { return }
                     do {
-                        let desktops = try self._enumerateDesktops()
+                        var desktops = try self._enumerateDesktops()
+                        // SkyLight's space list is often partial for the first
+                        // seconds after connect ("only 1 desktop"). If it looks
+                        // thin, give it a moment and ask again before replying.
+                        if desktops.count <= 1 {
+                            Thread.sleep(forTimeInterval: 1.0)
+                            if let retried = try? self._enumerateDesktops(), retried.count > desktops.count {
+                                desktops = retried
+                            }
+                        }
                         var payloadObj: [String: Any] = ["desktops": desktops]
                         if let currentIdx = self._currentDesktopIndex(from: desktops) { payloadObj["current_desktop_index"] = currentIdx }
                         let response: [String: Any] = [
@@ -1185,9 +1208,16 @@ final class NetworkManager {
                     return 280
                 }()
                 if CGPreflightScreenCaptureAccess() {
-                    Task.detached { [weak self, weak connection] in
-                        guard let self, let connection else { return }
-                        await self._sendDesktopPreviews(to: connection, maxWidth: previewWidth)
+                    // handleLine runs on `queue`, so the flag check is safe.
+                    if !self.previewsInFlight {
+                        self.previewsInFlight = true
+                        Task.detached { [weak self, weak connection] in
+                            guard let self else { return }
+                            if let connection {
+                                await self._sendDesktopPreviews(to: connection, maxWidth: previewWidth)
+                            }
+                            self.queue.async { [weak self] in self?.previewsInFlight = false }
+                        }
                     }
                 } else {
                     self.sendError("desktop_previews: screen recording permission missing", to: connection)
@@ -1203,6 +1233,26 @@ final class NetworkManager {
                             try self._focusDesktop(id: id)
                             // After focus, send updated state
                             self._sendDesktopsAndWindows(connection: connection)
+                            // Once the switch animation settles, snapshot the
+                            // desktop we just landed on and push its real
+                            // preview — this is how every visited desktop gets
+                            // a genuine screenshot in the switcher.
+                            Task.detached(priority: .utility) { [weak self, weak connection] in
+                                // Let the switch animation settle first.
+                                try? await Task.sleep(nanoseconds: 800_000_000)
+                                guard let self else { return }
+                                // Push under the id WE computed for the space
+                                // we actually landed on — not the client-sent
+                                // id, which can be stale.
+                                guard let snap = await self._snapshotCurrentDesktop(maxWidth: 280),
+                                      let connection else { return }
+                                self.queue.async { [weak self] in
+                                    self?.sendLine(connection, jsonObject: [
+                                        "type": "desktop_preview",
+                                        "payload": ["id": snap.id, "data": snap.jpeg.base64EncodedString()]
+                                    ])
+                                }
+                            }
                         } catch {
                             self.sendError("focus_desktop failed: \(error.localizedDescription)", to: connection)
                         }
@@ -1529,8 +1579,15 @@ private extension NetworkManager {
             var msid: Int?
             if let n = s["ManagedSpaceID"] as? NSNumber { msid = n.intValue } else if let n = s["ManagedSpaceID"] as? Int { msid = n }
             let isActive = (currentUUID != nil && uuid == currentUUID) || (currentMSID != nil && msid != nil && currentMSID == msid)
+            // STABLE id: prefer the ManagedSpaceID number. SkyLight sometimes
+            // omits uuids right after connect and fills them in later — if the
+            // id flips from the fallback to the uuid between fetches, every
+            // preview cached under the old id orphans ("preview stopped
+            // working"). The msid is present consistently; _focusDesktop
+            // already matches either form.
+            let stableID = msid.map(String.init) ?? uuid
             var obj: [String: Any] = [
-                "id": uuid,
+                "id": stableID,
                 "index": idx + 1,
                 "isActive": isActive
             ]
@@ -1625,24 +1682,62 @@ private extension NetworkManager {
     func checkTextFieldFocus(after delay: TimeInterval, connection: NWConnection) {
         queue.asyncAfter(deadline: .now() + delay) { [weak self, weak connection] in
             guard let self, let connection else { return }
-            let focused = Self.focusedElementIsTextInput()
-            self.lastTextFocusState = focused
+            let info = Self.focusedTextInputInfo()
+            self.lastTextFocusState = info.focused
             // Click-driven checks send UNCONDITIONALLY: change-gating here
             // proved fragile (a stale "already focused" suppressed the event
             // the phone needed). Repeats are idempotent on the client.
             self.sendLine(connection, jsonObject: [
                 "type": "text_focus",
-                "payload": ["focused": focused]
+                "payload": ["focused": info.focused]
             ])
+            // Diagnostic breadcrumb: exactly why auto-keyboard did/didn't fire.
+            let detail = "Text focus: \(info.focused ? "YES" : "no") (\(info.detail))"
+            if detail != self.lastFocusDetail {
+                self.lastFocusDetail = detail
+                self.emitActivity("keyboard", detail)
+            }
         }
     }
 
     private static func focusedElementIsTextInput() -> Bool {
+        focusedTextInputInfo().focused
+    }
+
+    /// Focus detection with a diagnostic string (for the Activity log — the
+    /// only way to see WHY auto-keyboard didn't fire on a given click).
+    static func focusedTextInputInfo() -> (focused: Bool, detail: String) {
+        // The system-wide focused element is flaky for some apps; fall back to
+        // asking the frontmost application directly.
+        var element: AXUIElement?
         let systemWide = AXUIElementCreateSystemWide()
         var focusedRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
-              let focusedRaw = focusedRef, CFGetTypeID(focusedRaw) == AXUIElementGetTypeID() else { return false }
-        let element = unsafeDowncast(focusedRaw as AnyObject, to: AXUIElement.self)
+        if AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
+           let raw = focusedRef, CFGetTypeID(raw) == AXUIElementGetTypeID() {
+            element = unsafeDowncast(raw as AnyObject, to: AXUIElement.self)
+        } else if let app = NSWorkspace.shared.frontmostApplication {
+            let appElement = AXUIElementCreateApplication(app.processIdentifier)
+            var appFocusedRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &appFocusedRef) == .success,
+               let raw = appFocusedRef, CFGetTypeID(raw) == AXUIElementGetTypeID() {
+                element = unsafeDowncast(raw as AnyObject, to: AXUIElement.self)
+            }
+        }
+        guard let element else { return (false, "no focused element readable") }
+        return (elementIsTextInput(element), roleDescription(of: element))
+    }
+
+    private static func roleDescription(of element: AXUIElement) -> String {
+        var roleRef: CFTypeRef?
+        var subroleRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef)
+        AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &subroleRef)
+        let role = (roleRef as? String) ?? "?"
+        if let subrole = subroleRef as? String { return "\(role)/\(subrole)" }
+        return role
+    }
+
+    private static func elementIsTextInput(_ element: AXUIElement) -> Bool {
         var roleRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success,
               let role = roleRef as? String else { return false }
@@ -1666,6 +1761,15 @@ private extension NetworkManager {
         var editableRef: CFTypeRef?
         if AXUIElementCopyAttributeValue(element, "AXEditableAncestor" as CFString, &editableRef) == .success,
            editableRef != nil {
+            return true
+        }
+
+        // Strongest generic signal: only text inputs have a selected text
+        // range (an insertion caret IS a zero-length selection); buttons,
+        // links, and checkboxes never do. Works across web and native.
+        var rangeRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
+           rangeRef != nil {
             return true
         }
 
@@ -1842,11 +1946,81 @@ private extension NetworkManager {
         return mapping
     }
 
-    /// Composites a miniature of every desktop from per-window screenshots and
-    /// streams them to the phone as individual "desktop_preview" messages.
-    /// SCContentFilter(desktopIndependentWindow:) can image a window no matter
-    /// which Space it lives on — the only way to preview non-current desktops.
+    // Cached real screenshots per Space id: the reliable core of desktop
+    // previews. Whenever we're ON a desktop (preview refresh, or right after a
+    // phone-driven switch) we snapshot the full display — the proven capture
+    // path — and cache it. Per-window captures of OTHER Spaces routinely come
+    // back black on modern macOS, so they're only a fallback for desktops the
+    // user hasn't visited yet this session. (Storage lives in the main class
+    // body — desktopSnapshots — since extensions can't hold stored properties.)
+
+    /// Captures the current desktop and caches its preview JPEG (async — the
+    /// old blocking version starved the Swift concurrency pool: the capture's
+    /// own startup task needed the threads the semaphore was parking, so
+    /// captures timed out (no previews) and blocked threads piled up (the
+    /// AirBridge hang that even force-quit couldn't kill).
+    /// Returns the (space id, jpeg) it cached so callers can push it directly.
+    @discardableResult
+    func _snapshotCurrentDesktop(maxWidth: Int) async -> (id: String, jpeg: Data)? {
+        guard let desktops = try? _enumerateDesktops(),
+              let currentIdx = _currentDesktopIndex(from: desktops),
+              let currentID = desktops.first(where: { ($0["index"] as? Int) == currentIdx })?["id"] as? String,
+              let shot = await _captureDisplayOnceAsync(),
+              let jpeg = jpegData(from: shot, maxWidth: maxWidth, quality: 0.7)
+        else { return nil }
+        queue.async { [weak self] in self?.desktopSnapshots[currentID] = jpeg }
+        return (currentID, jpeg)
+    }
+
+    /// One frame of the main display without blocking any thread: live stream
+    /// frame if streaming, else a one-shot capture with a 2.5s async timeout.
+    private func _captureDisplayOnceAsync() async -> CGImage? {
+        if let live = latestCapturedImage { return live }
+
+        final class OneShotConsumer: ScreenFrameConsumer {
+            var onFrame: ((CGImage) -> Void)?
+            func didProduceFrame(_ image: CGImage) { onFrame?(image) }
+        }
+        let helper = ScreenCaptureHelper()
+        let consumer = OneShotConsumer()  // helper.consumer is weak — keep alive
+        helper.consumer = consumer
+
+        return await withCheckedContinuation { (cont: CheckedContinuation<CGImage?, Never>) in
+            let lock = NSLock()
+            var resumed = false
+            func finish(_ image: CGImage?) {
+                lock.lock()
+                defer { lock.unlock() }
+                guard !resumed else { return }
+                resumed = true
+                consumer.onFrame = nil
+                helper.stop()
+                cont.resume(returning: image)
+            }
+            consumer.onFrame = { image in finish(image) }
+            Task {
+                do { try await helper.start() } catch { finish(nil) }
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: 2_500_000_000)  // cold SCK start takes 1-3s
+                finish(nil)
+            }
+        }
+    }
+
+    /// Streams one "desktop_preview" message per desktop: the cached real
+    /// screenshot when we have one, else a per-window composite (best effort —
+    /// SCContentFilter(desktopIndependentWindow:) can image windows on other
+    /// Spaces in principle, but often returns black in practice).
     func _sendDesktopPreviews(to connection: NWConnection, maxWidth: Int) async {
+        // Refresh the current desktop's snapshot first — the one
+        // guaranteed-good image of the batch.
+        await _snapshotCurrentDesktop(maxWidth: maxWidth)
+        let cached: [String: Data] = await withCheckedContinuation { cont in
+            queue.async { [weak self] in cont.resume(returning: self?.desktopSnapshots ?? [:]) }
+        }
+        var sentCached = 0
+        var sentComposited = 0
         guard let desktops = try? _enumerateDesktops(), !desktops.isEmpty,
               let winInfo = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else { return }
         let spaceMap = _buildWindowToSpaceIndexMap()
@@ -1875,21 +2049,29 @@ private extension NetworkManager {
             entries.append(Entry(id: num, bounds: b, space: space, app: app))
         }
 
-        // The CURRENT desktop gets a real full-screen shot — the same capture
-        // path the live stream uses, which is known-good. Per-window captures
-        // (needed for other Spaces) are unreliable for off-Space windows on
-        // recent macOS and often come back black; those get validated and fall
-        // back to colored window silhouettes so a preview is never just black.
-        let currentIdx = _currentDesktopIndex(from: desktops)
-        let fullShot = _captureDisplayOnce()
-
         var captureCache: [Int: CGImage] = [:]
         var capturesLeft = 24  // total screenshot budget per refresh
 
         for d in desktops {
             guard let idx = d["index"] as? Int, let id = d["id"] as? String else { continue }
+
+            // Cached real screenshot wins — send it straight through.
+            if let jpeg = cached[id] {
+                self.sendLine(connection, jsonObject: [
+                    "type": "desktop_preview",
+                    "payload": ["id": id, "data": jpeg.base64EncodedString()]
+                ])
+                sentCached += 1
+                continue
+            }
+
+            // No snapshot yet (desktop not visited this session): best-effort
+            // composite from per-window captures + silhouettes. Skip entirely
+            // when we know nothing about the desktop's windows — the client's
+            // placeholder is more honest than an empty dark card.
             // CGWindowList is front-to-back; keep the frontmost few, draw reversed.
             let wins = Array(entries.filter { $0.space == idx }.prefix(8))
+            guard !wins.isEmpty else { continue }
             guard let ctx = CGContext(data: nil, width: canvasW, height: canvasH,
                                       bitsPerComponent: 8, bytesPerRow: 0,
                                       space: CGColorSpaceCreateDeviceRGB(),
@@ -1897,34 +2079,30 @@ private extension NetworkManager {
             ctx.setFillColor(CGColor(red: 0.17, green: 0.18, blue: 0.23, alpha: 1))
             ctx.fill(CGRect(x: 0, y: 0, width: CGFloat(canvasW), height: CGFloat(canvasH)))
 
-            if idx == currentIdx, let shot = fullShot {
-                ctx.draw(shot, in: CGRect(x: 0, y: 0, width: CGFloat(canvasW), height: CGFloat(canvasH)))
-            } else {
-                for e in wins.reversed() {
-                    var img = captureCache[e.id]
-                    if img == nil, capturesLeft > 0, let sc = scByID[e.id] {
-                        capturesLeft -= 1
-                        let cfg = SCStreamConfiguration()
-                        cfg.width = max(2, Int(e.bounds.width * scale * 2))   // 2x for crispness
-                        cfg.height = max(2, Int(e.bounds.height * scale * 2))
-                        cfg.showsCursor = false
-                        let filter = SCContentFilter(desktopIndependentWindow: sc)
-                        if let captured = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg),
-                           !Self._isMostlyBlack(captured) {
-                            img = captured
-                            captureCache[e.id] = captured
-                        }
+            for e in wins.reversed() {
+                var img = captureCache[e.id]
+                if img == nil, capturesLeft > 0, let sc = scByID[e.id] {
+                    capturesLeft -= 1
+                    let cfg = SCStreamConfiguration()
+                    cfg.width = max(2, Int(e.bounds.width * scale * 2))   // 2x for crispness
+                    cfg.height = max(2, Int(e.bounds.height * scale * 2))
+                    cfg.showsCursor = false
+                    let filter = SCContentFilter(desktopIndependentWindow: sc)
+                    if let captured = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg),
+                       !Self._isMostlyBlack(captured) {
+                        img = captured
+                        captureCache[e.id] = captured
                     }
-                    // CGWindow bounds are top-left origin; CGContext is bottom-left.
-                    let r = CGRect(x: e.bounds.minX * scale,
-                                   y: CGFloat(canvasH) - e.bounds.maxY * scale,
-                                   width: e.bounds.width * scale,
-                                   height: e.bounds.height * scale)
-                    if let img {
-                        ctx.draw(img, in: r)
-                    } else {
-                        Self._drawWindowSilhouette(ctx, rect: r, appName: e.app)
-                    }
+                }
+                // CGWindow bounds are top-left origin; CGContext is bottom-left.
+                let r = CGRect(x: e.bounds.minX * scale,
+                               y: CGFloat(canvasH) - e.bounds.maxY * scale,
+                               width: e.bounds.width * scale,
+                               height: e.bounds.height * scale)
+                if let img {
+                    ctx.draw(img, in: r)
+                } else {
+                    Self._drawWindowSilhouette(ctx, rect: r, appName: e.app)
                 }
             }
 
@@ -1934,11 +2112,20 @@ private extension NetworkManager {
                 "type": "desktop_preview",
                 "payload": ["id": id, "data": jpeg.base64EncodedString()]
             ])
+            sentComposited += 1
         }
+
+        // Proof of delivery in the Activity tab: previews "not working" has
+        // been undiagnosable without knowing whether anything was even sent.
+        emitActivity("rectangle.on.rectangle",
+                     "Sent \(sentCached + sentComposited) desktop previews (\(sentCached) cached, \(sentComposited) composited)")
     }
 
     /// One frame of the main display: the live stream's latest frame when
-    /// streaming, else a one-shot ScreenCaptureKit capture (≤1s).
+    /// streaming, else a one-shot ScreenCaptureKit capture. The timeout must
+    /// cover a COLD ScreenCaptureKit start (shareable-content query + stream
+    /// spin-up + first frame ≈ 1–3s) — 1s timed out most of the time, which is
+    /// why previews rendered as empty dark cards.
     private func _captureDisplayOnce() -> CGImage? {
         if let live = latestCapturedImage { return live }
 
@@ -1957,7 +2144,7 @@ private extension NetworkManager {
         Task {
             do { try await helper.start() } catch { sema.signal() }
         }
-        let waitResult = sema.wait(timeout: .now() + 1.0)
+        let waitResult = sema.wait(timeout: .now() + 2.5)  // cold SCK start takes 1-3s
         helper.stop()
         guard waitResult == .success else { return nil }
         return consumer.image
@@ -2023,7 +2210,7 @@ private extension NetworkManager {
         Task {
             do { try await helper.start() } catch { sema.signal() }
         }
-        let waitResult = sema.wait(timeout: .now() + 1.0)
+        let waitResult = sema.wait(timeout: .now() + 2.5)  // cold SCK start takes 1-3s
         helper.stop()
         guard waitResult == .success, let frame = consumer.image else { return nil }
 
