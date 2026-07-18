@@ -45,6 +45,18 @@ final class AppState: ObservableObject {
     private var networkManager: NetworkManager!
 
     init() {
+        // Single instance only: two AirBridges fight over the fixed port and
+        // Bonjour registration, and both inject input — chaos. If another
+        // instance is already running, bring it forward and bow out.
+        let myPID = ProcessInfo.processInfo.processIdentifier
+        let bundleID = Bundle.main.bundleIdentifier ?? "com.airbridge"
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            .filter { $0.processIdentifier != myPID }
+        if let existing = others.first {
+            existing.activate()
+            DispatchQueue.main.async { NSApplication.shared.terminate(nil) }
+        }
+
         networkManager = NetworkManager(
             onReceivePacket: { [weak self] packet in
                 await self?.handle(packet: packet)

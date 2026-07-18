@@ -405,6 +405,9 @@ final class NetworkManager {
     var lastFocusDetail: String = ""
     // Cached desktop-preview screenshots per Space id (queue-confined).
     var desktopSnapshots: [String: Data] = [:]
+    // Coalesces preview refreshes: the client fires several in quick
+    // succession and each spun up its own capture stream (queue-confined).
+    var previewsInFlight = false
 
     /// Thread-safe toggle for suppressing input injection (menu bar / window).
     func setInputPaused(_ paused: Bool) {
@@ -1205,9 +1208,16 @@ final class NetworkManager {
                     return 280
                 }()
                 if CGPreflightScreenCaptureAccess() {
-                    Task.detached { [weak self, weak connection] in
-                        guard let self, let connection else { return }
-                        await self._sendDesktopPreviews(to: connection, maxWidth: previewWidth)
+                    // handleLine runs on `queue`, so the flag check is safe.
+                    if !self.previewsInFlight {
+                        self.previewsInFlight = true
+                        Task.detached { [weak self, weak connection] in
+                            guard let self else { return }
+                            if let connection {
+                                await self._sendDesktopPreviews(to: connection, maxWidth: previewWidth)
+                            }
+                            self.queue.async { [weak self] in self?.previewsInFlight = false }
+                        }
                     }
                 } else {
                     self.sendError("desktop_previews: screen recording permission missing", to: connection)
@@ -1227,12 +1237,14 @@ final class NetworkManager {
                             // desktop we just landed on and push its real
                             // preview — this is how every visited desktop gets
                             // a genuine screenshot in the switcher.
-                            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.8) { [weak self, weak connection] in
+                            Task.detached(priority: .utility) { [weak self, weak connection] in
+                                // Let the switch animation settle first.
+                                try? await Task.sleep(nanoseconds: 800_000_000)
                                 guard let self else { return }
                                 // Push under the id WE computed for the space
                                 // we actually landed on — not the client-sent
                                 // id, which can be stale.
-                                guard let snap = self._snapshotCurrentDesktop(maxWidth: 280),
+                                guard let snap = await self._snapshotCurrentDesktop(maxWidth: 280),
                                       let connection else { return }
                                 self.queue.async { [weak self] in
                                     self?.sendLine(connection, jsonObject: [
@@ -1942,18 +1954,58 @@ private extension NetworkManager {
     // user hasn't visited yet this session. (Storage lives in the main class
     // body — desktopSnapshots — since extensions can't hold stored properties.)
 
-    /// Captures the current desktop and caches its preview JPEG. Blocking ≤2.5s.
+    /// Captures the current desktop and caches its preview JPEG (async — the
+    /// old blocking version starved the Swift concurrency pool: the capture's
+    /// own startup task needed the threads the semaphore was parking, so
+    /// captures timed out (no previews) and blocked threads piled up (the
+    /// AirBridge hang that even force-quit couldn't kill).
     /// Returns the (space id, jpeg) it cached so callers can push it directly.
     @discardableResult
-    func _snapshotCurrentDesktop(maxWidth: Int) -> (id: String, jpeg: Data)? {
+    func _snapshotCurrentDesktop(maxWidth: Int) async -> (id: String, jpeg: Data)? {
         guard let desktops = try? _enumerateDesktops(),
               let currentIdx = _currentDesktopIndex(from: desktops),
               let currentID = desktops.first(where: { ($0["index"] as? Int) == currentIdx })?["id"] as? String,
-              let shot = _captureDisplayOnce(),
+              let shot = await _captureDisplayOnceAsync(),
               let jpeg = jpegData(from: shot, maxWidth: maxWidth, quality: 0.7)
         else { return nil }
         queue.async { [weak self] in self?.desktopSnapshots[currentID] = jpeg }
         return (currentID, jpeg)
+    }
+
+    /// One frame of the main display without blocking any thread: live stream
+    /// frame if streaming, else a one-shot capture with a 2.5s async timeout.
+    private func _captureDisplayOnceAsync() async -> CGImage? {
+        if let live = latestCapturedImage { return live }
+
+        final class OneShotConsumer: ScreenFrameConsumer {
+            var onFrame: ((CGImage) -> Void)?
+            func didProduceFrame(_ image: CGImage) { onFrame?(image) }
+        }
+        let helper = ScreenCaptureHelper()
+        let consumer = OneShotConsumer()  // helper.consumer is weak — keep alive
+        helper.consumer = consumer
+
+        return await withCheckedContinuation { (cont: CheckedContinuation<CGImage?, Never>) in
+            let lock = NSLock()
+            var resumed = false
+            func finish(_ image: CGImage?) {
+                lock.lock()
+                defer { lock.unlock() }
+                guard !resumed else { return }
+                resumed = true
+                consumer.onFrame = nil
+                helper.stop()
+                cont.resume(returning: image)
+            }
+            consumer.onFrame = { image in finish(image) }
+            Task {
+                do { try await helper.start() } catch { finish(nil) }
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: 2_500_000_000)  // cold SCK start takes 1-3s
+                finish(nil)
+            }
+        }
     }
 
     /// Streams one "desktop_preview" message per desktop: the cached real
@@ -1963,7 +2015,7 @@ private extension NetworkManager {
     func _sendDesktopPreviews(to connection: NWConnection, maxWidth: Int) async {
         // Refresh the current desktop's snapshot first — the one
         // guaranteed-good image of the batch.
-        _snapshotCurrentDesktop(maxWidth: maxWidth)
+        await _snapshotCurrentDesktop(maxWidth: maxWidth)
         let cached: [String: Data] = await withCheckedContinuation { cont in
             queue.async { [weak self] in cont.resume(returning: self?.desktopSnapshots ?? [:]) }
         }
