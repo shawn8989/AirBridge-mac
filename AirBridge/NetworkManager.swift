@@ -1524,6 +1524,7 @@ private typealias CGSCopyManagedDisplaySpacesFn = @convention(c) (CGSConnectionI
 private typealias CGSCopyActiveMenuBarDisplayIdentifierFn = @convention(c) (CGSConnectionID) -> Unmanaged<CFString>?
 private typealias CGSManagedDisplaySetCurrentSpaceFn = @convention(c) (CGSConnectionID, CFString, Int) -> Void
 private typealias CGSDefaultConnectionFn = @convention(c) () -> CGSConnectionID
+private typealias CGSCopySpacesForWindowsFn = @convention(c) (CGSConnectionID, Int32, CFArray) -> Unmanaged<CFArray>?
 
 private struct SkyLightPrivate {
     let handle: UnsafeMutableRawPointer?
@@ -1531,6 +1532,10 @@ private struct SkyLightPrivate {
     let copyActiveMenuBarDisplayIdentifier: CGSCopyActiveMenuBarDisplayIdentifierFn?
     let managedDisplaySetCurrentSpace: CGSManagedDisplaySetCurrentSpaceFn?
     let defaultConnection: CGSDefaultConnectionFn?
+    // Per-window Space lookup — the reliable way to learn which desktop a
+    // window lives on. The managed-display "Windows" arrays this replaced are
+    // often empty on modern macOS.
+    let copySpacesForWindows: CGSCopySpacesForWindowsFn?
 
     static let shared: SkyLightPrivate = {
         let path = "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight"
@@ -1544,7 +1549,9 @@ private struct SkyLightPrivate {
             copyManagedDisplaySpaces: load(handle, "CGSCopyManagedDisplaySpaces", as: CGSCopyManagedDisplaySpacesFn.self),
             copyActiveMenuBarDisplayIdentifier: load(handle, "CGSCopyActiveMenuBarDisplayIdentifier", as: CGSCopyActiveMenuBarDisplayIdentifierFn.self),
             managedDisplaySetCurrentSpace: load(handle, "CGSManagedDisplaySetCurrentSpace", as: CGSManagedDisplaySetCurrentSpaceFn.self),
-            defaultConnection: load(handle, "_CGSDefaultConnection", as: CGSDefaultConnectionFn.self)
+            defaultConnection: load(handle, "_CGSDefaultConnection", as: CGSDefaultConnectionFn.self),
+            copySpacesForWindows: load(handle, "SLSCopySpacesForWindows", as: CGSCopySpacesForWindowsFn.self)
+                ?? load(handle, "CGSCopySpacesForWindows", as: CGSCopySpacesForWindowsFn.self)
         )
     }()
 
@@ -1836,6 +1843,7 @@ private extension NetworkManager {
     func _enumerateOpenWindows() throws -> [[String: Any]] {
         guard let windowInfo = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else { return [] }
         let spaceMap = _buildWindowToSpaceIndexMap()
+        let msidToIndex = _msidToIndexMap()  // for the per-window SLS fallback
         var result: [[String: Any]] = []
         var axCache: [pid_t: [Int: Bool]] = [:]
         for w in windowInfo {
@@ -1843,6 +1851,11 @@ private extension NetworkManager {
             if layer != 0 { continue }
             guard let windowNumber = w[kCGWindowNumber as String] as? Int else { continue }
             guard let ownerPID = w[kCGWindowOwnerPID as String] as? Int32 else { continue }
+            // Tiny layer-0 windows are tab thumbnails/overlays, not real
+            // windows — with 100 Safari tabs they flooded the app list.
+            if let bDict = w[kCGWindowBounds as String] as? NSDictionary,
+               let b = CGRect(dictionaryRepresentation: bDict),
+               b.width < 80 || b.height < 60 { continue }
             let ownerName = w[kCGWindowOwnerName as String] as? String ?? ""
             let title = w[kCGWindowName as String] as? String ?? ""
             let isOnScreen = (w[kCGWindowIsOnscreen as String] as? Bool) ?? false
@@ -1863,7 +1876,14 @@ private extension NetworkManager {
                 "isOnScreen": isOnScreen,
                 "ownerPID": Int(ownerPID)
             ]
-            if let spaceIndex = spaceMap[windowNumber] { obj["space"] = spaceIndex }
+            // Legacy map first (cheap), else the reliable per-window SLS query —
+            // without a space, the phone can neither group by desktop nor jump.
+            if let spaceIndex = spaceMap[windowNumber] {
+                obj["space"] = spaceIndex
+            } else if let msid = _windowMSIDViaSLS(windowNumber: windowNumber),
+                      let spaceIndex = msidToIndex[msid] {
+                obj["space"] = spaceIndex
+            }
             result.append(obj)
         }
         return result
@@ -2238,7 +2258,40 @@ private extension NetworkManager {
         return nil
     }
 
+    /// ManagedSpaceID -> ordinal index (1-based) from the current enumeration.
+    func _msidToIndexMap() -> [Int: Int] {
+        guard let desktops = try? _enumerateDesktops() else { return [:] }
+        var map: [Int: Int] = [:]
+        for d in desktops {
+            if let idx = d["index"] as? Int, let id = d["id"] as? String, let msid = Int(id) {
+                map[msid] = idx
+            }
+        }
+        return map
+    }
+
+    /// The ManagedSpaceID of the Space containing a window, straight from
+    /// SkyLight's per-window query (selector 7 = all space kinds, fullscreen
+    /// apps included). Works where the managed-display "Windows" arrays don't.
+    func _windowMSIDViaSLS(windowNumber: Int) -> Int? {
+        let api = SkyLightPrivate.shared
+        guard let fn = api.copySpacesForWindows else { return nil }
+        let ids = [NSNumber(value: windowNumber)] as CFArray
+        guard let result = fn(api.connection, 7, ids)?.takeRetainedValue() as? [NSNumber],
+              let msid = result.first?.intValue else { return nil }
+        return msid
+    }
+
     func _windowSpaceInfo(windowNumber: Int) -> (id: String, index: Int)? {
+        // Reliable path first: ask SkyLight which Space this window is on.
+        if let msid = _windowMSIDViaSLS(windowNumber: windowNumber) {
+            let map = _msidToIndexMap()
+            if let idx = map[msid] { return (String(msid), idx) }
+        }
+        return _windowSpaceInfoLegacy(windowNumber: windowNumber)
+    }
+
+    private func _windowSpaceInfoLegacy(windowNumber: Int) -> (id: String, index: Int)? {
         let api = SkyLightPrivate.shared
         guard let copy = api.copyManagedDisplaySpaces else { return nil }
         let conn = api.connection
