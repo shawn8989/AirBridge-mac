@@ -13,6 +13,7 @@ import UniformTypeIdentifiers
 #if os(macOS)
 import ScreenCaptureKit
 import AVFoundation
+import CoreAudio
 import VideoToolbox
 import CoreServices
 import AppKit
@@ -828,6 +829,25 @@ final class NetworkManager {
                         }
                     }
                 }
+            case "request_audio_devices":
+                // The phone's speaker picker: every output device the Mac
+                // currently knows about, with the active one flagged.
+                #if os(macOS)
+                self.sendAudioDevices(to: connection)
+                #endif
+            case "set_audio_device":
+                #if os(macOS)
+                if let payload = dict["payload"] as? [String: Any], let uid = payload["uid"] as? String {
+                    let name = (payload["name"] as? String) ?? uid
+                    self.setDefaultAudioOutput(uid: uid)
+                    self.emitActivity("hifispeaker", "Audio output → \(name)")
+                    // Re-send the list shortly after so the phone's checkmark moves.
+                    self.queue.asyncAfter(deadline: .now() + 0.3) { [weak self, weak connection] in
+                        guard let self, let connection else { return }
+                        self.sendAudioDevices(to: connection)
+                    }
+                }
+                #endif
             case "type_text":
                 // Types a whole string on the Mac (dictation, clipboard paste-through).
                 if let payload = dict["payload"] as? [String: Any], let text = payload["text"] as? String {
@@ -1859,6 +1879,87 @@ private extension NetworkManager {
     }
 
     /// Runs an AppleScript snippet; MUST be called on the main thread.
+    // MARK: - Audio output devices (CoreAudio)
+    // Lets the phone bounce the Mac's sound between speakers, TV, headphones.
+    // Only devices the Mac already knows about appear — an AirPlay speaker the
+    // Mac has never connected to won't be listed until picked once on the Mac.
+
+    private func _audioOutputDevices() -> [(id: AudioDeviceID, uid: String, name: String)] {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        let sys = AudioObjectID(kAudioObjectSystemObject)
+        guard AudioObjectGetPropertyDataSize(sys, &addr, 0, nil, &size) == noErr, size > 0 else { return [] }
+        var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(sys, &addr, 0, nil, &size, &ids) == noErr else { return [] }
+
+        var result: [(AudioDeviceID, String, String)] = []
+        for id in ids {
+            // Output-capable = has at least one output stream.
+            var streamsAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyStreams,
+                mScope: kAudioDevicePropertyScopeOutput,
+                mElement: kAudioObjectPropertyElementMain)
+            var streamsSize: UInt32 = 0
+            guard AudioObjectGetPropertyDataSize(id, &streamsAddr, 0, nil, &streamsSize) == noErr,
+                  streamsSize > 0 else { continue }
+
+            var uidAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyDeviceUID,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain)
+            var uid: CFString = "" as CFString
+            var uidSize = UInt32(MemoryLayout<CFString>.size)
+            guard AudioObjectGetPropertyData(id, &uidAddr, 0, nil, &uidSize, &uid) == noErr else { continue }
+
+            var nameAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioObjectPropertyName,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain)
+            var name: CFString = "" as CFString
+            var nameSize = UInt32(MemoryLayout<CFString>.size)
+            guard AudioObjectGetPropertyData(id, &nameAddr, 0, nil, &nameSize, &name) == noErr else { continue }
+
+            result.append((id, uid as String, name as String))
+        }
+        return result
+    }
+
+    private func _defaultOutputDeviceID() -> AudioDeviceID {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var id: AudioDeviceID = 0
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &id)
+        return id
+    }
+
+    func setDefaultAudioOutput(uid: String) {
+        guard let device = _audioOutputDevices().first(where: { $0.uid == uid }) else { return }
+        var id = device.id
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil,
+                                   UInt32(MemoryLayout<AudioDeviceID>.size), &id)
+    }
+
+    func sendAudioDevices(to connection: NWConnection) {
+        let current = _defaultOutputDeviceID()
+        let devices = _audioOutputDevices().map { d -> [String: Any] in
+            ["uid": d.uid, "name": d.name, "isCurrent": d.id == current]
+        }
+        sendLine(connection, jsonObject: [
+            "type": "audio_devices",
+            "payload": ["devices": devices]
+        ])
+    }
+
     func runAppleScript(_ source: String) -> NSAppleEventDescriptor? {
         var error: NSDictionary?
         let result = NSAppleScript(source: source)?.executeAndReturnError(&error)
