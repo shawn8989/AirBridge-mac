@@ -13,6 +13,7 @@ import UniformTypeIdentifiers
 #if os(macOS)
 import ScreenCaptureKit
 import AVFoundation
+import CoreAudio
 import VideoToolbox
 import CoreServices
 import AppKit
@@ -766,8 +767,11 @@ final class NetworkManager {
                         // depend on the Mission Control keyboard shortcuts being
                         // enabled and is far more reliable than posted key events.
                         case "left", "right":
+                            let skipFS = (payload["skipFullscreen"] as? Bool) ?? false
                             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                                self?.switchSpace(offset: direction == "right" ? 1 : -1, fallbackFingers: fingers)
+                                self?.switchSpace(offset: direction == "right" ? 1 : -1,
+                                                  fallbackFingers: fingers,
+                                                  skipFullscreen: skipFS)
                             }
                         // Up/down open Mission Control / App Exposé by launching
                         // Mission Control.app directly — synthetic Ctrl+Arrow is
@@ -825,6 +829,25 @@ final class NetworkManager {
                         }
                     }
                 }
+            case "request_audio_devices":
+                // The phone's speaker picker: every output device the Mac
+                // currently knows about, with the active one flagged.
+                #if os(macOS)
+                self.sendAudioDevices(to: connection)
+                #endif
+            case "set_audio_device":
+                #if os(macOS)
+                if let payload = dict["payload"] as? [String: Any], let uid = payload["uid"] as? String {
+                    let name = (payload["name"] as? String) ?? uid
+                    self.setDefaultAudioOutput(uid: uid)
+                    self.emitActivity("hifispeaker", "Audio output → \(name)")
+                    // Re-send the list shortly after so the phone's checkmark moves.
+                    self.queue.asyncAfter(deadline: .now() + 0.3) { [weak self, weak connection] in
+                        guard let self, let connection else { return }
+                        self.sendAudioDevices(to: connection)
+                    }
+                }
+                #endif
             case "type_text":
                 // Types a whole string on the Mac (dictation, clipboard paste-through).
                 if let payload = dict["payload"] as? [String: Any], let text = payload["text"] as? String {
@@ -1524,6 +1547,7 @@ private typealias CGSCopyManagedDisplaySpacesFn = @convention(c) (CGSConnectionI
 private typealias CGSCopyActiveMenuBarDisplayIdentifierFn = @convention(c) (CGSConnectionID) -> Unmanaged<CFString>?
 private typealias CGSManagedDisplaySetCurrentSpaceFn = @convention(c) (CGSConnectionID, CFString, Int) -> Void
 private typealias CGSDefaultConnectionFn = @convention(c) () -> CGSConnectionID
+private typealias CGSCopySpacesForWindowsFn = @convention(c) (CGSConnectionID, Int32, CFArray) -> Unmanaged<CFArray>?
 
 private struct SkyLightPrivate {
     let handle: UnsafeMutableRawPointer?
@@ -1531,6 +1555,10 @@ private struct SkyLightPrivate {
     let copyActiveMenuBarDisplayIdentifier: CGSCopyActiveMenuBarDisplayIdentifierFn?
     let managedDisplaySetCurrentSpace: CGSManagedDisplaySetCurrentSpaceFn?
     let defaultConnection: CGSDefaultConnectionFn?
+    // Per-window Space lookup — the reliable way to learn which desktop a
+    // window lives on. The managed-display "Windows" arrays this replaced are
+    // often empty on modern macOS.
+    let copySpacesForWindows: CGSCopySpacesForWindowsFn?
 
     static let shared: SkyLightPrivate = {
         let path = "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight"
@@ -1544,7 +1572,9 @@ private struct SkyLightPrivate {
             copyManagedDisplaySpaces: load(handle, "CGSCopyManagedDisplaySpaces", as: CGSCopyManagedDisplaySpacesFn.self),
             copyActiveMenuBarDisplayIdentifier: load(handle, "CGSCopyActiveMenuBarDisplayIdentifier", as: CGSCopyActiveMenuBarDisplayIdentifierFn.self),
             managedDisplaySetCurrentSpace: load(handle, "CGSManagedDisplaySetCurrentSpace", as: CGSManagedDisplaySetCurrentSpaceFn.self),
-            defaultConnection: load(handle, "_CGSDefaultConnection", as: CGSDefaultConnectionFn.self)
+            defaultConnection: load(handle, "_CGSDefaultConnection", as: CGSDefaultConnectionFn.self),
+            copySpacesForWindows: load(handle, "SLSCopySpacesForWindows", as: CGSCopySpacesForWindowsFn.self)
+                ?? load(handle, "CGSCopySpacesForWindows", as: CGSCopySpacesForWindowsFn.self)
         )
     }()
 
@@ -1560,39 +1590,64 @@ private extension NetworkManager {
         let conn = api.connection
         guard let displays = copy(conn)?.takeRetainedValue() as? [[String: Any]], !displays.isEmpty else { return [] }
         let activeDisplayID = api.copyActiveMenuBarDisplayIdentifier?(conn)?.takeRetainedValue() as String?
-        let displayDict: [String: Any] = {
-            if let active = activeDisplayID, let dict = displays.first(where: { ($0["Display Identifier"] as? String) == active }) { return dict }
-            return displays[0]
-        }()
-        let spaces = displayDict["Spaces"] as? [[String: Any]] ?? []
-        var currentUUID: String?
-        var currentMSID: Int?
-        if let cur = displayDict["Current Space"] as? [String: Any] {
-            currentUUID = cur["uuid"] as? String
-            if let n = cur["ManagedSpaceID"] as? NSNumber { currentMSID = n.intValue }
-            else if let n = cur["ManagedSpaceID"] as? Int { currentMSID = n }
+
+        // Every display's Spaces, with the active (menu-bar) display first. On
+        // a MacBook + external monitor each display keeps its OWN Space list —
+        // only reading one of them made the other display's desktops invisible
+        // (the "never lands on a blank desktop" bug on dual-screen setups).
+        var ordered = displays
+        if let active = activeDisplayID,
+           let i = ordered.firstIndex(where: { ($0["Display Identifier"] as? String) == active }), i != 0 {
+            ordered.swapAt(0, i)
         }
+
         var result: [[String: Any]] = []
-        for (idx, s) in spaces.enumerated() {
-            let uuid = (s["uuid"] as? String) ?? String(describing: s["ManagedSpaceID"] ?? "")
-            let name = s["Name"] as? String
-            var msid: Int?
-            if let n = s["ManagedSpaceID"] as? NSNumber { msid = n.intValue } else if let n = s["ManagedSpaceID"] as? Int { msid = n }
-            let isActive = (currentUUID != nil && uuid == currentUUID) || (currentMSID != nil && msid != nil && currentMSID == msid)
-            // STABLE id: prefer the ManagedSpaceID number. SkyLight sometimes
-            // omits uuids right after connect and fills them in later — if the
-            // id flips from the fallback to the uuid between fetches, every
-            // preview cached under the old id orphans ("preview stopped
-            // working"). The msid is present consistently; _focusDesktop
-            // already matches either form.
-            let stableID = msid.map(String.init) ?? uuid
-            var obj: [String: Any] = [
-                "id": stableID,
-                "index": idx + 1,
-                "isActive": isActive
-            ]
-            if let name = name { obj["name"] = name }
-            result.append(obj)
+        var globalIndex = 0
+        for (dIdx, displayDict) in ordered.enumerated() {
+            let displayIdentifier = (displayDict["Display Identifier"] as? String) ?? ""
+            let spaces = displayDict["Spaces"] as? [[String: Any]] ?? []
+            // Each display has its own current Space, so multiple entries can
+            // be isActive at once — one per screen.
+            var currentUUID: String?
+            var currentMSID: Int?
+            if let cur = displayDict["Current Space"] as? [String: Any] {
+                currentUUID = cur["uuid"] as? String
+                if let n = cur["ManagedSpaceID"] as? NSNumber { currentMSID = n.intValue }
+                else if let n = cur["ManagedSpaceID"] as? Int { currentMSID = n }
+            }
+            for s in spaces {
+                globalIndex += 1
+                let uuid = (s["uuid"] as? String) ?? String(describing: s["ManagedSpaceID"] ?? "")
+                let name = s["Name"] as? String
+                var msid: Int?
+                if let n = s["ManagedSpaceID"] as? NSNumber { msid = n.intValue } else if let n = s["ManagedSpaceID"] as? Int { msid = n }
+                let isActive = (currentUUID != nil && uuid == currentUUID) || (currentMSID != nil && msid != nil && currentMSID == msid)
+                // STABLE id: prefer the ManagedSpaceID number. SkyLight sometimes
+                // omits uuids right after connect and fills them in later — if the
+                // id flips from the fallback to the uuid between fetches, every
+                // preview cached under the old id orphans ("preview stopped
+                // working"). The msid is present consistently; _focusDesktop
+                // already matches either form.
+                let stableID = msid.map(String.init) ?? uuid
+                // Full-screen-app Spaces are detected on THREE signals — the
+                // classic type==4 alone doesn't match on every macOS build:
+                // they also carry a tile-layout manager and an owning app pid,
+                // which regular user desktops never do.
+                let spaceType = (s["type"] as? NSNumber)?.intValue ?? (s["type"] as? Int ?? 0)
+                let isFullscreen = spaceType == 4
+                    || s["TileLayoutManager"] != nil
+                    || s["pid"] != nil
+                var obj: [String: Any] = [
+                    "id": stableID,
+                    "index": globalIndex,
+                    "isActive": isActive,
+                    "isFullscreen": isFullscreen,
+                    "display": dIdx + 1,
+                    "displayIdentifier": displayIdentifier
+                ]
+                if let name = name { obj["name"] = name }
+                result.append(obj)
+            }
         }
         return result
     }
@@ -1611,40 +1666,78 @@ private extension NetworkManager {
         guard let copy = api.copyManagedDisplaySpaces, let setCurrent = api.managedDisplaySetCurrentSpace else { throw AirBridgeError.spacesUnavailable }
         let conn = api.connection
         guard let displays = copy(conn)?.takeRetainedValue() as? [[String: Any]], !displays.isEmpty else { return }
-        let activeDisplayID = api.copyActiveMenuBarDisplayIdentifier?(conn)?.takeRetainedValue() as String?
-        let displayDict: [String: Any] = {
-            if let active = activeDisplayID, let dict = displays.first(where: { ($0["Display Identifier"] as? String) == active }) { return dict }
-            return displays[0]
-        }()
-        let displayIdentifier = (displayDict["Display Identifier"] as? String) ?? ""
-        let spaces = displayDict["Spaces"] as? [[String: Any]] ?? []
-        guard let target = spaces.first(where: { ($0["uuid"] as? String) == id || String(describing: $0["ManagedSpaceID"] ?? "") == id }) else { throw AirBridgeError.spaceNotFound }
-        let msid: Int
-        if let n = target["ManagedSpaceID"] as? NSNumber { msid = n.intValue }
-        else if let n = target["ManagedSpaceID"] as? Int { msid = n }
-        else { throw AirBridgeError.spaceNotFound }
-        setCurrent(conn, displayIdentifier as CFString, msid)
+        // Search EVERY display for the Space and switch on the display that
+        // owns it — a Space can only be made current on its own screen.
+        for displayDict in displays {
+            let spaces = displayDict["Spaces"] as? [[String: Any]] ?? []
+            guard let target = spaces.first(where: { ($0["uuid"] as? String) == id || String(describing: $0["ManagedSpaceID"] ?? "") == id }) else { continue }
+            let msid: Int
+            if let n = target["ManagedSpaceID"] as? NSNumber { msid = n.intValue }
+            else if let n = target["ManagedSpaceID"] as? Int { msid = n }
+            else { throw AirBridgeError.spaceNotFound }
+            let displayIdentifier = (displayDict["Display Identifier"] as? String) ?? ""
+            setCurrent(conn, displayIdentifier as CFString, msid)
+            return
+        }
+        throw AirBridgeError.spaceNotFound
     }
 
     /// Switches to the Space `offset` positions away (e.g. +1 = the Space to the
     /// right) using SkyLight directly, so it works regardless of the Mission
     /// Control keyboard-shortcut settings. Falls back to a synthetic Ctrl+Arrow
     /// only if the private API is unavailable.
-    func switchSpace(offset: Int, fallbackFingers: Int) {
+    func switchSpace(offset: Int, fallbackFingers: Int, skipFullscreen: Bool = false) {
         do {
-            let desktops = try _enumerateDesktops()
-            guard !desktops.isEmpty else { throw AirBridgeError.spacesUnavailable }
-            guard let current = _currentDesktopIndex(from: desktops) else { throw AirBridgeError.spaceNotFound }
-            let targetIndex = current + offset
+            let all = try _enumerateDesktops()
+            guard !all.isEmpty else { throw AirBridgeError.spacesUnavailable }
+            // _enumerateDesktops puts the menu-bar display first, so the first
+            // active entry is the Space the user is looking at. Hop only among
+            // THAT display's Spaces: each screen has its own strip, and mixing
+            // them made the walk step onto the other monitor's list.
+            guard let currentEntry = all.first(where: { ($0["isActive"] as? Bool) == true }) else { throw AirBridgeError.spaceNotFound }
+            let display = currentEntry["display"] as? Int ?? 1
+            let desktops = all.filter { ($0["display"] as? Int ?? 1) == display }
+            guard let currentPos = desktops.firstIndex(where: { ($0["id"] as? String) == (currentEntry["id"] as? String) }) else { throw AirBridgeError.spaceNotFound }
+            // Walk in the requested direction; with skipFullscreen, hop over
+            // full-screen-app Spaces so the Desktop buttons land on real
+            // desktops instead of cycling through every maximized app.
+            let step = offset > 0 ? 1 : -1
+            var pos = currentPos + step
+            var target: [String: Any]?
+            while pos >= 0 && pos < desktops.count {
+                let candidate = desktops[pos]
+                let isFS = (candidate["isFullscreen"] as? Bool) ?? false
+                if !skipFullscreen || !isFS {
+                    target = candidate
+                    break
+                }
+                pos += step
+            }
+            let current = currentEntry["index"] as? Int ?? 0
             // No wrap-around: stay put at the edges, matching native behavior.
-            guard targetIndex >= 1, targetIndex <= desktops.count,
-                  let target = desktops.first(where: { ($0["index"] as? Int) == targetIndex }),
-                  let id = target["id"] as? String else {
-                print("[NetworkManager] switchSpace: no Space at index \(targetIndex) (have \(desktops.count))")
+            guard let target, let id = target["id"] as? String else {
+                print("[NetworkManager] switchSpace: no eligible Space beyond index \(current) on display \(display) (have \(desktops.count))")
+                if skipFullscreen {
+                    emitActivity("rectangle.righthalf.inset.filled.arrow.right",
+                                 "No regular desktop \(offset > 0 ? "to the right" : "to the left") of \(current) on this screen — only full-screen apps")
+                }
                 return
             }
+            let targetIndex = target["index"] as? Int ?? 0
             try _focusDesktop(id: id)
-            print("[NetworkManager] switchSpace -> index \(targetIndex)")
+            print("[NetworkManager] switchSpace -> index \(targetIndex)\(skipFullscreen ? " (skipping full-screen apps)" : "")")
+            if skipFullscreen {
+                // Diagnostic breadcrumb: shows exactly what the hop saw, so a
+                // misdetected space type is visible in the Activity tab.
+                let kinds = all.map { d -> String in
+                    let i = d["index"] as? Int ?? 0
+                    let fs = (d["isFullscreen"] as? Bool) ?? false
+                    let disp = d["display"] as? Int ?? 1
+                    return "\(i)\(fs ? "F" : "D")\(disp > 1 ? "·\(disp)" : "")"
+                }.joined(separator: " ")
+                emitActivity("rectangle.righthalf.inset.filled.arrow.right",
+                             "Desktop hop \(current)→\(targetIndex) (screen \(display)) [\(kinds)]")
+            }
         } catch {
             // SkyLight unavailable; fall back to the keyboard shortcut.
             print("[NetworkManager] switchSpace falling back to Ctrl+Arrow: \(error)")
@@ -1786,6 +1879,87 @@ private extension NetworkManager {
     }
 
     /// Runs an AppleScript snippet; MUST be called on the main thread.
+    // MARK: - Audio output devices (CoreAudio)
+    // Lets the phone bounce the Mac's sound between speakers, TV, headphones.
+    // Only devices the Mac already knows about appear — an AirPlay speaker the
+    // Mac has never connected to won't be listed until picked once on the Mac.
+
+    private func _audioOutputDevices() -> [(id: AudioDeviceID, uid: String, name: String)] {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        let sys = AudioObjectID(kAudioObjectSystemObject)
+        guard AudioObjectGetPropertyDataSize(sys, &addr, 0, nil, &size) == noErr, size > 0 else { return [] }
+        var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(sys, &addr, 0, nil, &size, &ids) == noErr else { return [] }
+
+        var result: [(AudioDeviceID, String, String)] = []
+        for id in ids {
+            // Output-capable = has at least one output stream.
+            var streamsAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyStreams,
+                mScope: kAudioDevicePropertyScopeOutput,
+                mElement: kAudioObjectPropertyElementMain)
+            var streamsSize: UInt32 = 0
+            guard AudioObjectGetPropertyDataSize(id, &streamsAddr, 0, nil, &streamsSize) == noErr,
+                  streamsSize > 0 else { continue }
+
+            var uidAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyDeviceUID,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain)
+            var uid: CFString = "" as CFString
+            var uidSize = UInt32(MemoryLayout<CFString>.size)
+            guard AudioObjectGetPropertyData(id, &uidAddr, 0, nil, &uidSize, &uid) == noErr else { continue }
+
+            var nameAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioObjectPropertyName,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain)
+            var name: CFString = "" as CFString
+            var nameSize = UInt32(MemoryLayout<CFString>.size)
+            guard AudioObjectGetPropertyData(id, &nameAddr, 0, nil, &nameSize, &name) == noErr else { continue }
+
+            result.append((id, uid as String, name as String))
+        }
+        return result
+    }
+
+    private func _defaultOutputDeviceID() -> AudioDeviceID {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var id: AudioDeviceID = 0
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &id)
+        return id
+    }
+
+    func setDefaultAudioOutput(uid: String) {
+        guard let device = _audioOutputDevices().first(where: { $0.uid == uid }) else { return }
+        var id = device.id
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil,
+                                   UInt32(MemoryLayout<AudioDeviceID>.size), &id)
+    }
+
+    func sendAudioDevices(to connection: NWConnection) {
+        let current = _defaultOutputDeviceID()
+        let devices = _audioOutputDevices().map { d -> [String: Any] in
+            ["uid": d.uid, "name": d.name, "isCurrent": d.id == current]
+        }
+        sendLine(connection, jsonObject: [
+            "type": "audio_devices",
+            "payload": ["devices": devices]
+        ])
+    }
+
     func runAppleScript(_ source: String) -> NSAppleEventDescriptor? {
         var error: NSDictionary?
         let result = NSAppleScript(source: source)?.executeAndReturnError(&error)
@@ -1836,6 +2010,7 @@ private extension NetworkManager {
     func _enumerateOpenWindows() throws -> [[String: Any]] {
         guard let windowInfo = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else { return [] }
         let spaceMap = _buildWindowToSpaceIndexMap()
+        let msidToIndex = _msidToIndexMap()  // for the per-window SLS fallback
         var result: [[String: Any]] = []
         var axCache: [pid_t: [Int: Bool]] = [:]
         for w in windowInfo {
@@ -1843,6 +2018,11 @@ private extension NetworkManager {
             if layer != 0 { continue }
             guard let windowNumber = w[kCGWindowNumber as String] as? Int else { continue }
             guard let ownerPID = w[kCGWindowOwnerPID as String] as? Int32 else { continue }
+            // Tiny layer-0 windows are tab thumbnails/overlays, not real
+            // windows — with 100 Safari tabs they flooded the app list.
+            if let bDict = w[kCGWindowBounds as String] as? NSDictionary,
+               let b = CGRect(dictionaryRepresentation: bDict),
+               b.width < 80 || b.height < 60 { continue }
             let ownerName = w[kCGWindowOwnerName as String] as? String ?? ""
             let title = w[kCGWindowName as String] as? String ?? ""
             let isOnScreen = (w[kCGWindowIsOnscreen as String] as? Bool) ?? false
@@ -1863,7 +2043,14 @@ private extension NetworkManager {
                 "isOnScreen": isOnScreen,
                 "ownerPID": Int(ownerPID)
             ]
-            if let spaceIndex = spaceMap[windowNumber] { obj["space"] = spaceIndex }
+            // Legacy map first (cheap), else the reliable per-window SLS query —
+            // without a space, the phone can neither group by desktop nor jump.
+            if let spaceIndex = spaceMap[windowNumber] {
+                obj["space"] = spaceIndex
+            } else if let msid = _windowMSIDViaSLS(windowNumber: windowNumber),
+                      let spaceIndex = msidToIndex[msid] {
+                obj["space"] = spaceIndex
+            }
             result.append(obj)
         }
         return result
@@ -2238,7 +2425,40 @@ private extension NetworkManager {
         return nil
     }
 
+    /// ManagedSpaceID -> ordinal index (1-based) from the current enumeration.
+    func _msidToIndexMap() -> [Int: Int] {
+        guard let desktops = try? _enumerateDesktops() else { return [:] }
+        var map: [Int: Int] = [:]
+        for d in desktops {
+            if let idx = d["index"] as? Int, let id = d["id"] as? String, let msid = Int(id) {
+                map[msid] = idx
+            }
+        }
+        return map
+    }
+
+    /// The ManagedSpaceID of the Space containing a window, straight from
+    /// SkyLight's per-window query (selector 7 = all space kinds, fullscreen
+    /// apps included). Works where the managed-display "Windows" arrays don't.
+    func _windowMSIDViaSLS(windowNumber: Int) -> Int? {
+        let api = SkyLightPrivate.shared
+        guard let fn = api.copySpacesForWindows else { return nil }
+        let ids = [NSNumber(value: windowNumber)] as CFArray
+        guard let result = fn(api.connection, 7, ids)?.takeRetainedValue() as? [NSNumber],
+              let msid = result.first?.intValue else { return nil }
+        return msid
+    }
+
     func _windowSpaceInfo(windowNumber: Int) -> (id: String, index: Int)? {
+        // Reliable path first: ask SkyLight which Space this window is on.
+        if let msid = _windowMSIDViaSLS(windowNumber: windowNumber) {
+            let map = _msidToIndexMap()
+            if let idx = map[msid] { return (String(msid), idx) }
+        }
+        return _windowSpaceInfoLegacy(windowNumber: windowNumber)
+    }
+
+    private func _windowSpaceInfoLegacy(windowNumber: Int) -> (id: String, index: Int)? {
         let api = SkyLightPrivate.shared
         guard let copy = api.copyManagedDisplaySpaces else { return nil }
         let conn = api.connection
