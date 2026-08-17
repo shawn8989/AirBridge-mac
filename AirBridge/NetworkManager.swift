@@ -553,7 +553,17 @@ final class NetworkManager {
                         _ = try? self?._enumerateDesktops()
                     }
                     #endif
-                    var serverInfo: [String: Any] = ["macID": self.machineID(), "macName": self.machineName()]
+                    // Version + feature list so the phone can adapt instead of
+                    // failing oddly against an older Mac app. Additive features
+                    // go in the list; the version is only used to SUGGEST an
+                    // update, never to refuse a connection.
+                    var serverInfo: [String: Any] = [
+                        "macID": self.machineID(),
+                        "macName": self.machineName(),
+                        "appVersion": (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0",
+                        "protocolVersion": kAirBridgeProtocolVersion,
+                        "features": BridgeFeature.all
+                    ]
                     #if os(macOS)
                     // Hardware address lets the phone send Wake-on-LAN packets
                     // when this Mac is asleep (needs "Wake for network access").

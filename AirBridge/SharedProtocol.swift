@@ -372,3 +372,42 @@ public enum AirSecureChannel {
         return params
     }
 }
+
+// MARK: - Capability negotiation
+//
+// AirPad and AirBridge ship separately: the phone updates through the App
+// Store, the Mac app by download, so mismatched pairs are normal rather than
+// exceptional. An older AirBridge mostly works with a newer AirPad — it just
+// lacks whatever was added since.
+//
+// So compatibility is expressed as a FEATURE LIST, not a version gate. The Mac
+// declares what it can do; the phone hides or explains the parts that aren't
+// there and keeps everything else working. Nothing is ever hard-blocked on a
+// version number — a version is only used to suggest an update.
+
+public enum BridgeFeature {
+    /// Remote CoreAudio output switching (audio_devices / set_audio_device).
+    public static let audioDevices = "audio_devices"
+    /// Space enumeration across every display, with a "display" field.
+    public static let multiDisplaySpaces = "multi_display_spaces"
+    /// Desktop preview thumbnails (desktop_preview).
+    public static let desktopPreviews = "desktop_previews"
+    /// swipe payload honours skipFullscreen.
+    public static let skipFullscreen = "skip_fullscreen"
+    /// server_info carries macAddress for Wake-on-LAN.
+    public static let wakeOnLAN = "wake_on_lan"
+    /// Live screen streaming.
+    public static let liveScreen = "live_screen"
+
+    /// Everything the CURRENT build supports. Add a string here when a feature
+    /// lands, and check for it on the phone instead of assuming it exists.
+    public static let all: [String] = [
+        audioDevices, multiDisplaySpaces, desktopPreviews,
+        skipFullscreen, wakeOnLAN, liveScreen
+    ]
+}
+
+/// Coarse compatibility counter. Bump only for a CHANGE IN MEANING of an
+/// existing message (which old builds would misinterpret); a purely additive
+/// feature needs a BridgeFeature entry, not a bump.
+public let kAirBridgeProtocolVersion = 2

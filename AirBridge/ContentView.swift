@@ -164,6 +164,16 @@ private struct StatusTab: View {
             VStack(spacing: 12) {
                 if let update = appState.updateChecker.available {
                     updateBanner(update)
+                } else if appState.updateChecker.lastCheckFoundNothing {
+                    HStack {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                        Text("AirBridge is up to date")
+                            .font(.callout)
+                        Spacer()
+                    }
+                    .padding(10)
+                    .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))
                 }
 
                 if needsSetup {

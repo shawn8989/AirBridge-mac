@@ -17,6 +17,16 @@ struct AirBridgeApp: App {
                 .environmentObject(appState)
         }
         .windowResizability(.contentSize)
+        .commands {
+            // The phone tells users to update from here, so the menu item has
+            // to exist and has to report the "already current" case too.
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") {
+                    appState.updateChecker.checkNow()
+                }
+                .disabled(appState.updateChecker.checking)
+            }
+        }
 
         Settings {
             ContentView()
