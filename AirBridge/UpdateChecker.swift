@@ -18,10 +18,27 @@ final class UpdateChecker: ObservableObject {
     }
 
     @Published var available: Update?
+    /// Set after a manual check that found nothing, so the UI can say
+    /// "you're up to date" rather than appearing to do nothing.
+    @Published var lastCheckFoundNothing = false
+    @Published var checking = false
 
-    private static let releasesAPI = URL(string: "https://api.github.com/repos/shawn8989/AirBridge-mac/releases/latest")!
-    private static let releasesPage = URL(string: "https://github.com/shawn8989/AirBridge-mac/releases/latest")!
+    private static let releasesAPI = URL(string: "https://api.github.com/repos/shawn8989/Wield Host-mac/releases/latest")!
+    private static let releasesPage = URL(string: "https://github.com/shawn8989/Wield Host-mac/releases/latest")!
     private var timer: Timer?
+
+    /// User-initiated check. Reports the "already current" case, which the
+    /// automatic check deliberately stays silent about.
+    func checkNow() {
+        guard !checking else { return }
+        checking = true
+        lastCheckFoundNothing = false
+        Task {
+            await fetch()
+            checking = false
+            lastCheckFoundNothing = (available == nil)
+        }
+    }
 
     func check() {
         Task { await fetch() }

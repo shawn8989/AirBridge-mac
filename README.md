@@ -1,6 +1,6 @@
-# AirBridge
+# Wield Host
 
-**The macOS companion for [AirPad](https://github.com/shawn8989/AirPad)** —
+**The macOS companion for [Wield](https://github.com/shawn8989/AirPad)** —
 turn your iPhone into a trackpad, keyboard, Wii-style air mouse, and camera
 hand-gesture controller for your Mac.
 
@@ -11,7 +11,7 @@ hand-gesture controller for your Mac.
 
 ## What it does
 
-AirBridge advertises your Mac on the local network (Bonjour), authenticates
+Wield Host advertises your Mac on the local network (Bonjour), authenticates
 paired iPhones, and injects their input — cursor, clicks, scrolling, gestures,
 keyboard, media keys, clipboard, dictation — using the macOS Accessibility APIs.
 
@@ -39,15 +39,15 @@ keyboard, media keys, clipboard, dictation — using the macOS Accessibility API
 - macOS 14 or later.
 - **Accessibility permission** (System Settings → Privacy & Security →
   Accessibility) — required to move the cursor and type on your behalf.
-- AirPad on an iPhone, same Wi-Fi network.
+- Wield on an iPhone, same Wi-Fi network.
 
 ## Install
 
 Download the notarized DMG from
 [Releases](https://github.com/shawn8989/AirBridge-mac/releases/latest), drag
-AirBridge to Applications, open it, and follow the in-app checklist.
+Wield Host to Applications, open it, and follow the in-app checklist.
 
-> AirBridge is distributed outside the Mac App Store because apps that inject
+> Wield Host is distributed outside the Mac App Store because apps that inject
 > input require the Accessibility permission, which App Store rules don't
 > allow. Builds are Developer ID-signed and notarized by Apple.
 

@@ -74,7 +74,7 @@ struct ContentView: View {
         HStack(spacing: 12) {
             BrandIcon(size: 42)
             VStack(alignment: .leading, spacing: 1) {
-                Text("AirBridge")
+                Text("Wield Host")
                     .font(.title2.bold())
                 Text(appState.macName)
                     .font(.caption)
@@ -164,6 +164,16 @@ private struct StatusTab: View {
             VStack(spacing: 12) {
                 if let update = appState.updateChecker.available {
                     updateBanner(update)
+                } else if appState.updateChecker.lastCheckFoundNothing {
+                    HStack {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                        Text("Wield Host is up to date")
+                            .font(.callout)
+                        Spacer()
+                    }
+                    .padding(10)
+                    .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))
                 }
 
                 if needsSetup {
@@ -184,7 +194,7 @@ private struct StatusTab: View {
         } label: {
             HStack {
                 Image(systemName: "arrow.down.circle.fill")
-                Text("AirBridge \(update.version) is available")
+                Text("Wield Host \(update.version) is available")
                     .font(.callout.weight(.medium))
                 Spacer()
                 Text("Get Update")
@@ -208,12 +218,12 @@ private struct StatusTab: View {
                                           options: .repeating,
                                           isActive: appState.serverEnabled && !appState.inputPaused)
                         Text(appState.serverEnabled
-                             ? (appState.connectedDevices.isEmpty ? "Waiting for AirPad…" : "Live")
+                             ? (appState.connectedDevices.isEmpty ? "Waiting for Wield…" : "Live")
                              : "Server is off")
                             .font(.headline)
                     }
                     Text(appState.connectedDevices.isEmpty
-                         ? "Open AirPad on your iPhone — same Wi-Fi network."
+                         ? "Open Wield on your iPhone — same Wi-Fi network."
                          : "\(appState.connectedDevices.count) device\(appState.connectedDevices.count == 1 ? "" : "s") connected")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -285,7 +295,7 @@ private struct SetupChecklist: View {
             }
 
             checklistRow(done: appState.accessibilityOK,
-                         title: "Allow AirBridge to control this Mac",
+                         title: "Allow Wield Host to control this Mac",
                          subtitle: "System Settings → Privacy & Security → Accessibility") {
                 if !appState.accessibilityOK {
                     Button("Open Settings") { appState.openAccessibilitySettings() }
@@ -303,8 +313,8 @@ private struct SetupChecklist: View {
             }
 
             checklistRow(done: !appState.knownDeviceIDs.isEmpty || !appState.connectedDevices.isEmpty,
-                         title: "Get AirPad on your iPhone",
-                         subtitle: "App Store → AirPad, then open it on the same Wi-Fi") { EmptyView() }
+                         title: "Get Wield on your iPhone",
+                         subtitle: "App Store → Wield, then open it on the same Wi-Fi") { EmptyView() }
 
             checklistRow(done: !appState.knownDeviceIDs.isEmpty || !appState.connectedDevices.isEmpty,
                          title: "Pair your iPhone",
@@ -380,7 +390,7 @@ private struct DevicesTab: View {
                     Label("Connected", systemImage: "iphone.radiowaves.left.and.right")
                         .font(.subheadline.weight(.semibold))
                     if appState.connectedDevices.isEmpty {
-                        Text("No devices connected. Open AirPad on your iPhone — same Wi-Fi network.")
+                        Text("No devices connected. Open Wield on your iPhone — same Wi-Fi network.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                             .padding(.vertical, 6)
@@ -567,7 +577,7 @@ struct QRPairingView: View {
                 Text("Could not generate QR code.")
                     .foregroundStyle(.secondary)
             }
-            Text("In AirPad, tap “Scan QR” and point the camera here.\nThe code works once and expires in 2 minutes.")
+            Text("In Wield, tap “Scan QR” and point the camera here.\nThe code works once and expires in 2 minutes.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

@@ -12,11 +12,21 @@ struct AirBridgeApp: App {
     @StateObject private var appState = AppState()
 
     var body: some Scene {
-        Window("AirBridge", id: "main") {
+        Window("Wield Host", id: "main") {
             ContentView()
                 .environmentObject(appState)
         }
         .windowResizability(.contentSize)
+        .commands {
+            // The phone tells users to update from here, so the menu item has
+            // to exist and has to report the "already current" case too.
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") {
+                    appState.updateChecker.checkNow()
+                }
+                .disabled(appState.updateChecker.checking)
+            }
+        }
 
         Settings {
             ContentView()
@@ -60,7 +70,7 @@ struct MenuBarContent: View {
             HStack(spacing: 10) {
                 BrandIcon(size: 30)
                 VStack(alignment: .leading, spacing: 0) {
-                    Text("AirBridge").font(.headline)
+                    Text("Wield Host").font(.headline)
                     Text(appState.connectedDevices.isEmpty
                          ? "No devices connected"
                          : "\(appState.connectedDevices.count) device\(appState.connectedDevices.count == 1 ? "" : "s") · \(appState.eventsPerSecond)/s")
