@@ -13,10 +13,9 @@
 # Usage:  ./scripts/make-dmg.sh
 # Output: dist/Wield Host.dmg  (signed, notarized, stapled)
 #
-# The Xcode target is still named AirBridge internally, so the exported bundle
-# is AirBridge.app. It is renamed to "Wield Host.app" before signing, because
-# this is what a reviewer downloads and drags to Applications — a mismatched
-# filename there reads as the wrong app.
+# PRODUCT_NAME is "Wield Host", so the export is already Wield Host.app. The
+# rename below is kept as a no-op fallback for archives built before that
+# change (the Xcode target itself is still named AirBridge internally).
 #
 set -euo pipefail
 
