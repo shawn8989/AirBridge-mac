@@ -294,6 +294,10 @@ private struct SetupChecklist: View {
                 }
             }
 
+            if runningTranslocated {
+                translocationWarning
+            }
+
             checklistRow(done: appState.accessibilityOK,
                          title: "Allow Wield Host to control this Mac",
                          subtitle: "System Settings → Privacy & Security → Accessibility") {
@@ -323,6 +327,36 @@ private struct SetupChecklist: View {
                     .controlSize(.small)
             }
         }
+    }
+
+    /// macOS runs a downloaded app from a randomized read-only copy until it is
+    /// moved to Applications ("app translocation"). Accessibility granted to
+    /// that copy is silently discarded — and because moving the cursor needs no
+    /// permission at all, the app looks perfectly connected while every click
+    /// and keystroke is dropped. It is the single most confusing way this app
+    /// can fail, so say so before the user spends an hour on it.
+    private var runningTranslocated: Bool {
+        Bundle.main.bundlePath.contains("/AppTranslocation/")
+    }
+
+    private var translocationWarning: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Move Wield Host to your Applications folder")
+                    .font(.subheadline.weight(.semibold))
+                Text("It is running from a temporary copy, so macOS will discard the "
+                     + "permissions below no matter how many times you grant them. "
+                     + "Quit, drag the app to Applications, and open it from there.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+        }
+        .padding(10)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
     }
 
     private func checklistRow<Trailing: View>(done: Bool, title: String, subtitle: String,

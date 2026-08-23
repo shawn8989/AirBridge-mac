@@ -265,7 +265,10 @@ footer a { color: var(--muted); }
     <p class="sub">Two apps: <strong>Wield Host</strong> runs quietly on the Mac (menu bar),
        <strong>Wield</strong> is the remote on your iPhone.</p>
     <div class="steps">
-      <div class="step"><div class="n"></div><div><strong>Download Wield Host</strong> on your Mac (free) and open it.
+      <div class="step"><div class="n"></div><div><strong>Download Wield Host</strong> and drag it to your Applications folder.
+        <small><strong>Move it before you open it.</strong> macOS runs downloaded apps from a temporary
+        location until they are in Applications, and permissions granted there silently don't stick.</small></div></div>
+      <div class="step"><div class="n"></div><div><strong>Open Wield Host</strong> from Applications.
         <small>Grant the Accessibility permission when asked — that's how it moves your cursor.</small></div></div>
       <div class="step"><div class="n"></div><div><strong>Get Wield</strong> on your iPhone from the App Store.</div></div>
       <div class="step"><div class="n"></div><div><strong>Same Wi-Fi, tap your Mac, approve the pairing.</strong>
@@ -402,6 +405,16 @@ footer a { color: var(--muted); }
     <details><summary>The cursor doesn't move</summary>
       <p>macOS needs to trust Wield Host: System Settings &rsaquo; Privacy &amp; Security &rsaquo;
          Accessibility &rsaquo; enable Wield Host. Wield Host's own checklist links straight there.</p>
+    </details>
+    <details><summary>The cursor moves, but clicks and typing do nothing</summary>
+      <p>Almost always this one thing: <strong>Wield Host is not in your Applications folder.</strong>
+         Until it is, macOS keeps running it from a temporary read-only copy, and the Accessibility
+         permission you grant is attached to that copy and quietly thrown away.</p>
+      <p>Moving the cursor doesn't need that permission, so the app looks connected and working —
+         while every click and keystroke is silently discarded.</p>
+      <p>Quit Wield Host, drag it to Applications, and open it from there. If the checkmarks in its
+         checklist still don't appear, remove any old entries under System Settings &rsaquo; Privacy
+         &amp; Security &rsaquo; Accessibility with the &minus; button and grant it again.</p>
     </details>
     <details><summary>Live Screen is blank</summary>
       <p>That's the Screen Recording permission: System Settings &rsaquo; Privacy &amp; Security
