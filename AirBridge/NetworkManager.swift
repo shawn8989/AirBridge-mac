@@ -47,14 +47,14 @@ private protocol ScreenFrameConsumer: AnyObject {
 private final class ScreenCaptureHelper: NSObject, SCStreamOutput, SCStreamDelegate {
     private var stream: SCStream?
     private var sampleBufferDisplayLayer = AVSampleBufferDisplayLayer()
-    private let queue = DispatchQueue(label: "AirBridge.ScreenCapture")
+    private let queue = DispatchQueue(label: "Wield Host.ScreenCapture")
     weak var consumer: ScreenFrameConsumer?
     private(set) var lastFrame: CGImage?
 
     func start() async throws {
         let content = try await SCShareableContent.current
         guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) ?? content.displays.first else {
-            throw NSError(domain: "AirBridge", code: -2, userInfo: [NSLocalizedDescriptionKey: "No display available for capture"]) }
+            throw NSError(domain: "Wield Host", code: -2, userInfo: [NSLocalizedDescriptionKey: "No display available for capture"]) }
         let filter = SCContentFilter(display: display, excludingWindows: [])
         let config = SCStreamConfiguration()
         config.scalesToFit = true
@@ -159,7 +159,7 @@ final class NetworkManager {
         let now = CFAbsoluteTimeGetCurrent()
         guard now - lastUserActivityDeclared > 5 else { return }
         lastUserActivityDeclared = now
-        IOPMAssertionDeclareUserActivity("AirPad remote input" as CFString,
+        IOPMAssertionDeclareUserActivity("Wield remote input" as CFString,
                                          kIOPMUserActiveLocal,
                                          &userActivityAssertionID)
     }
@@ -221,7 +221,7 @@ final class NetworkManager {
     func restartAdvertising() {
         queue.async { [weak self] in
             guard let self, self.listener != nil else { return }
-            print("[AirBridge] Re-registering Bonjour service")
+            print("[Wield Host] Re-registering Bonjour service")
             self.listener?.cancel()
             self.listener = nil
             for (_, connection) in self.activeConnections { connection.cancel() }
@@ -237,7 +237,7 @@ final class NetworkManager {
         #if os(macOS)
         if !wakeObserverInstalled {
             wakeObserverInstalled = true
-            // Re-advertise after every wake — the #1 cause of "AirBridge says
+            // Re-advertise after every wake — the #1 cause of "Wield Host says
             // advertising but the phone can't find the Mac".
             NSWorkspace.shared.notificationCenter.addObserver(
                 forName: NSWorkspace.didWakeNotification, object: nil, queue: nil) { [weak self] _ in
@@ -270,8 +270,8 @@ final class NetworkManager {
             listener.stateUpdateHandler = { [weak self] state in
                 switch state {
                 case .ready:
-                    print("[AirBridge] Bonjour advertising _airbridge._tcp and listening")
-                    print("[AirBridge] Listener ready on port: \(String(describing: self?.listener?.port))")
+                    print("[Wield Host] Bonjour advertising _airbridge._tcp and listening")
+                    print("[Wield Host] Listener ready on port: \(String(describing: self?.listener?.port))")
                 case .failed(let error):
                     // A failed listener means we're invisible while the UI
                     // still says "advertising" — recreate it.
@@ -302,7 +302,7 @@ final class NetworkManager {
         let key = ObjectIdentifier(connection)
         connectionBoxes[key] = box
         activeConnections[key] = connection
-        print("[AirBridge] Accepted connection: \(connection)")
+        print("[Wield Host] Accepted connection: \(connection)")
         // Removed: initial pair_response send on accept per instructions.
 
         connection.stateUpdateHandler = { [weak self, weak connection] state in
@@ -331,7 +331,7 @@ final class NetworkManager {
         let deviceID = box.deviceID
         connectionBoxes.removeValue(forKey: key)
         activeConnections.removeValue(forKey: key)
-        print("[AirBridge] Connection closed (\(reason))")
+        print("[Wield Host] Connection closed (\(reason))")
         eventInjector.releaseAllModifiers()
         stopVideoStream()
         onDeviceDisconnected(deviceID)
@@ -501,10 +501,10 @@ final class NetworkManager {
         do {
             let obj = try JSONSerialization.jsonObject(with: lineData, options: [])
             guard let dict = obj as? [String: Any], let type = dict["type"] as? String else {
-                throw NSError(domain: "AirBridge", code: -1, userInfo: [NSLocalizedDescriptionKey: "Missing type field"])
+                throw NSError(domain: "Wield Host", code: -1, userInfo: [NSLocalizedDescriptionKey: "Missing type field"])
             }
             if !Self.quietTypes.contains(type), let raw = String(data: lineData, encoding: .utf8) {
-                print("[AirBridge] RX line: \(raw)")
+                print("[Wield Host] RX line: \(raw)")
             }
             // Gate all functional messages until the connection has proven
             // knowledge of the device's per-device shared secret via the
@@ -589,10 +589,10 @@ final class NetworkManager {
                             self.onDeviceConnected(deviceID)
                             let handler = self.onQRPaired
                             DispatchQueue.main.async { handler?(deviceID) }
-                            print("[AirBridge] QR-paired device \(deviceID)")
+                            print("[Wield Host] QR-paired device \(deviceID)")
                             break
                         } else {
-                            print("[AirBridge] QR proof mismatch from \(deviceID)")
+                            print("[Wield Host] QR proof mismatch from \(deviceID)")
                         }
                     }
                     // Attempt to load existing secret
@@ -1435,7 +1435,7 @@ final class NetworkManager {
             }
         } catch {
             let raw = String(data: lineData, encoding: .utf8) ?? "<non-utf8>"
-            print("[AirBridge] Parse error: \(error.localizedDescription) line=\(raw)")
+            print("[Wield Host] Parse error: \(error.localizedDescription) line=\(raw)")
             sendError("parse_error: \(error.localizedDescription)", to: connection)
         }
     }
@@ -1447,7 +1447,7 @@ final class NetworkManager {
             data.append(0x0A)
             connection.send(content: data, completion: .contentProcessed { _ in })
         } catch {
-            print("[AirBridge] Failed to encode JSON: \(error)")
+            print("[Wield Host] Failed to encode JSON: \(error)")
         }
     }
 

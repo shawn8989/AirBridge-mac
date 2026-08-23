@@ -1,13 +1,13 @@
-# AGENTS.md — AirBridge (macOS)
+# AGENTS.md — Wield Host (macOS)
 
 Instructions for AI coding agents (Codex, Claude Code, etc.) working in this
 repo. Read this before touching code.
 
 ## What this is
 
-AirBridge is the free macOS companion for **AirPad**, an iPhone app in a
+Wield Host is the free macOS companion for **Wield**, an iPhone app in a
 separate repo (`shawn8989/AirPad`) that turns the phone into a trackpad,
-keyboard, live screen, and gesture remote. AirBridge does the actual work on the
+keyboard, live screen, and gesture remote. Wield Host does the actual work on the
 Mac: injects input, streams the screen, enumerates Spaces and windows, switches
 audio output.
 
@@ -40,7 +40,7 @@ verified by CI either — say which parts are unverified.
 
 ## Invariants — do not "simplify" these
 
-Each one was an expensive bug. Context in the AirPad repo's `docs/vault/Decisions.md`.
+Each one was an expensive bug. Context in the Wield repo's `docs/vault/Decisions.md`.
 
 | Invariant | Why |
 |---|---|

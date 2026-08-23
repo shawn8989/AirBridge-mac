@@ -81,7 +81,7 @@ final class AppState: ObservableObject {
                     let name = self.displayName(for: deviceID)
                     self.statusMessage = "Connected: \(name)"
                     self.logActivity("iphone.radiowaves.left.and.right", "\(name) connected")
-                    self.notify("AirPad connected", name)
+                    self.notify("Wield connected", name)
                 }
             },
             onDeviceDisconnected: { [weak self] deviceID in
@@ -92,7 +92,7 @@ final class AppState: ObservableObject {
                         let name = self.displayName(for: id)
                         self.statusMessage = "Disconnected: \(name)"
                         self.logActivity("iphone.slash", "\(name) disconnected")
-                        self.notify("AirPad disconnected", name)
+                        self.notify("Wield disconnected", name)
                     } else {
                         self.statusMessage = "Disconnected"
                     }

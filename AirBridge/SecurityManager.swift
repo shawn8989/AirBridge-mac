@@ -73,11 +73,11 @@ final class SecurityManager {
 
     /// Derives the per-device shared secret from a scanned QR pairing secret.
     /// MUST match AirPad's derivation exactly (HKDF-SHA256, salt = deviceID,
-    /// info = "AirPad-QR-Pair", 32 bytes).
+    /// info = "Wield-QR-Pair", 32 bytes).
     func deriveQRPairSecret(qrSecret: Data, deviceID: String) -> Data {
         let key = HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: qrSecret),
                                          salt: Data(deviceID.utf8),
-                                         info: Data("AirPad-QR-Pair".utf8),
+                                         info: Data("Wield-QR-Pair".utf8),
                                          outputByteCount: 32)
         var out = Data()
         key.withUnsafeBytes { out.append(contentsOf: $0) }
@@ -134,7 +134,7 @@ final class SecurityManager {
         guard expected == packet.hmac else { throw SecurityError.invalidHMAC }
     }
 
-    private let serverIdentityLabel = "AirBridge Server Identity"
+    private let serverIdentityLabel = "Wield Host Server Identity"
 
     // Attempt to load a server identity (certificate + private key) from the Keychain by label.
     // You can create/import a self-signed identity via Keychain Access and set its label to match serverIdentityLabel.

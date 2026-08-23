@@ -23,8 +23,8 @@ final class UpdateChecker: ObservableObject {
     @Published var lastCheckFoundNothing = false
     @Published var checking = false
 
-    private static let releasesAPI = URL(string: "https://api.github.com/repos/shawn8989/AirBridge-mac/releases/latest")!
-    private static let releasesPage = URL(string: "https://github.com/shawn8989/AirBridge-mac/releases/latest")!
+    private static let releasesAPI = URL(string: "https://api.github.com/repos/shawn8989/Wield Host-mac/releases/latest")!
+    private static let releasesPage = URL(string: "https://github.com/shawn8989/Wield Host-mac/releases/latest")!
     private var timer: Timer?
 
     /// User-initiated check. Reports the "already current" case, which the
