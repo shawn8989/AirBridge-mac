@@ -686,6 +686,15 @@ final class NetworkManager {
                     } catch {
                         self.sendError("mouse_up failed: \(error.localizedDescription)", to: connection)
                     }
+                    // Same focus check as mouse_click. A Hand Mouse pinch, a
+                    // Live Screen touch, and drag-lock all click via
+                    // down/up rather than mouse_click, so gating this on
+                    // mouse_click alone meant the auto keyboard never rose for
+                    // any of them.
+                    if kind == .left {
+                        self.checkTextFieldFocus(after: 0.25, connection: connection)
+                        self.checkTextFieldFocus(after: 1.0, connection: connection)
+                    }
                 }
             case "mouse_click":
                 // Convenience that performs down+up using eventInjector.clickMouse(kind:)
