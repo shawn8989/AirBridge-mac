@@ -419,10 +419,36 @@ final class AppState: ObservableObject {
             }
             let decision = PairDecision()
             decision.add(continuation)
-            pendingPairRequest = PairRequest(deviceID: deviceID,
-                                             proposedSecret: proposedSecret,
-                                             decision: decision)
+            let request = PairRequest(deviceID: deviceID,
+                                      proposedSecret: proposedSecret,
+                                      decision: decision)
+            pendingPairRequest = request
+
+            // A prompt nobody answers must not leave the phone waiting forever.
+            // From the phone's side an unresolved pairing is indistinguishable
+            // from a frozen app: it connects, then nothing, with no error to
+            // show. Deny after a minute so the connection fails visibly and can
+            // be retried.
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 60 * 1_000_000_000)
+                guard let self, !request.decision.isDecided else { return }
+                self.logActivity("clock.badge.xmark",
+                                 "Pairing request timed out for \(self.displayName(for: deviceID))")
+                await self.handlePairingDecision(allowed: false, request: request)
+            }
         }
+    }
+
+    /// Acts on whatever prompt is actually on screen.
+    ///
+    /// The sheet closure captures a PairRequest by value, so if a second
+    /// request replaced the first while the sheet was up, Allow decided the
+    /// *old* one — which was already resolved, so the guard below dropped it
+    /// and the prompt just sat there doing nothing. Reading the current
+    /// request here means the button can never be wired to a stale one.
+    func decideCurrentPairing(allowed: Bool) async {
+        guard let request = pendingPairRequest else { return }
+        await handlePairingDecision(allowed: allowed, request: request)
     }
 
     func handlePairingDecision(allowed: Bool, request: PairRequest) async {
