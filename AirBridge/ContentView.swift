@@ -563,6 +563,13 @@ struct PairingPromptView: View {
     let request: PairRequest
     let onDecision: (Bool) -> Void
 
+    /// The sheet does not disappear on the same runloop turn as the tap, so
+    /// without this both buttons stay live during the dismissal. The model is
+    /// now safe against a second decision anyway, but a button that visibly
+    /// does nothing on the second press is better than one that silently
+    /// swallows it.
+    @State private var decided = false
+
     var body: some View {
         VStack(spacing: 16) {
             Image(systemName: "iphone.radiowaves.left.and.right")
@@ -579,15 +586,22 @@ struct PairingPromptView: View {
                 .foregroundStyle(.tertiary)
                 .multilineTextAlignment(.center)
             HStack(spacing: 12) {
-                Button("Deny") { onDecision(false) }
+                Button("Deny") { decide(false) }
                     .keyboardShortcut(.cancelAction)
-                Button("Allow") { onDecision(true) }
+                Button("Allow") { decide(true) }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
             }
+            .disabled(decided)
         }
         .padding(24)
         .frame(minWidth: 340)
+    }
+
+    private func decide(_ allowed: Bool) {
+        guard !decided else { return }
+        decided = true
+        onDecision(allowed)
     }
 }
 

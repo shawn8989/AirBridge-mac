@@ -34,6 +34,9 @@ private final class ConnectionBox {
     // connection has proven knowledge of the device's shared secret.
     var authenticated = false
     var authNonce: Data?
+    /// Set after telling the peer once that it is not authorized, so an input
+    /// stream arriving at ~120/s cannot turn into 120 error messages a second.
+    var warnedUnauthenticated = false
     init(secret: Data) { self.pendingSecret = secret }
 }
 
@@ -513,6 +516,17 @@ final class NetworkManager {
             // inject input nor read system/app information.
             let openTypes: Set<String> = ["hello", "pair_request", "auth_proof", "bye"]
             if !openTypes.contains(type) && !box.authenticated {
+                // Dropping these silently is what made a half-finished pairing
+                // look like a working connection: the phone reported connected
+                // and every command vanished with no error anywhere. Say so
+                // once per connection — repeating it would flood a link that
+                // sends input at ~120/s.
+                if !box.warnedUnauthenticated {
+                    box.warnedUnauthenticated = true
+                    self.sendError("Not paired yet — approve this device on the Mac", to: connection)
+                    self.emitActivity("exclamationmark.shield",
+                                      "Ignoring input from an unapproved device (\(box.deviceID ?? "unknown"))")
+                }
                 return
             }
             // Explicit goodbye from the phone's Disconnect button: tear down
