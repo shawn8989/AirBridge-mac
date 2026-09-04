@@ -420,6 +420,15 @@ footer a { color: var(--muted); }
       <p>That's the Screen Recording permission: System Settings &rsaquo; Privacy &amp; Security
          &rsaquo; Screen Recording &rsaquo; enable Wield Host, then relaunch Wield Host.</p>
     </details>
+    <details><summary>My Mac asks to pair every time, or pairing never finishes</summary>
+      <p>Wield Host and your iPhone each keep half of a shared key. If one side loses its
+         half — you reinstalled Wield Host, reset its permissions, or moved to a different
+         Mac — the two no longer agree, and the connection can complete without ever being
+         authorised. The phone says "connected" and nothing responds.</p>
+      <p>Current versions detect this and re-pair themselves, so it should heal on the next
+         connection. If it doesn't: in Wield Host click <strong>Forget</strong> next to the
+         device, then connect again from the phone and approve the prompt. That clears both
+         halves and starts fresh.</p></details>
     <details><summary>Some features are missing or greyed out</summary>
       <p>The Mac app is probably older than the iPhone app. In Wield Host's menu choose
          "Check for Updates…", or download the latest build above. Wield keeps working with

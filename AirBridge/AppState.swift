@@ -41,6 +41,8 @@ final class PairDecision {
     private var waiting: [CheckedContinuation<Bool, Never>] = []
     private var decision: Bool?
 
+    var isDecided: Bool { decision != nil }
+
     func add(_ continuation: CheckedContinuation<Bool, Never>) {
         if let decision {
             continuation.resume(returning: decision)   // already answered
@@ -426,16 +428,31 @@ final class AppState: ObservableObject {
     func handlePairingDecision(allowed: Bool, request: PairRequest) async {
         // A second press of Allow, or a decision for a request that was already
         // superseded, must not reach the continuation twice.
-        guard request.decision.resume(allowed) else { return }
-        if pendingPairRequest?.id == request.id { pendingPairRequest = nil }
+        guard !request.decision.isDecided else { return }
+
+        // Persist BEFORE answering. Resuming first tells the phone it is paired
+        // and lets it reconnect while this side still has no secret — which
+        // lands it straight back on "unknown device", the loop that made
+        // Forget-and-retry necessary. A Keychain failure has to deny, not
+        // hand out a pairing this Mac cannot honour.
+        var granted = allowed
         if allowed {
             do {
                 try securityManager.storeSharedSecret(request.proposedSecret, for: request.deviceID)
-                statusMessage = "Paired with \(displayName(for: request.deviceID))"
-                logActivity("checkmark.seal", "Paired \(displayName(for: request.deviceID))")
             } catch {
+                granted = false
                 statusMessage = "Keychain error: \(error.localizedDescription)"
+                logActivity("xmark.seal", "Pairing failed: \(error.localizedDescription)")
             }
+        }
+
+        guard request.decision.resume(granted) else { return }
+        if pendingPairRequest?.id == request.id { pendingPairRequest = nil }
+        if granted {
+            statusMessage = "Paired with \(displayName(for: request.deviceID))"
+            logActivity("checkmark.seal", "Paired \(displayName(for: request.deviceID))")
+        } else if allowed {
+            // Denied only because the Keychain write failed; already logged.
         } else {
             statusMessage = "Connection denied for \(displayName(for: request.deviceID))"
             logActivity("xmark.seal", "Denied pairing for \(displayName(for: request.deviceID))")
