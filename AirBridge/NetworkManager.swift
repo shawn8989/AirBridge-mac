@@ -34,6 +34,9 @@ private final class ConnectionBox {
     // connection has proven knowledge of the device's shared secret.
     var authenticated = false
     var authNonce: Data?
+    /// Set after telling the peer once that it is not authorized, so an input
+    /// stream arriving at ~120/s cannot turn into 120 error messages a second.
+    var warnedUnauthenticated = false
     init(secret: Data) { self.pendingSecret = secret }
 }
 
@@ -513,6 +516,17 @@ final class NetworkManager {
             // inject input nor read system/app information.
             let openTypes: Set<String> = ["hello", "pair_request", "auth_proof", "bye"]
             if !openTypes.contains(type) && !box.authenticated {
+                // Dropping these silently is what made a half-finished pairing
+                // look like a working connection: the phone reported connected
+                // and every command vanished with no error anywhere. Say so
+                // once per connection — repeating it would flood a link that
+                // sends input at ~120/s.
+                if !box.warnedUnauthenticated {
+                    box.warnedUnauthenticated = true
+                    self.sendError("Not paired yet — approve this device on the Mac", to: connection)
+                    self.emitActivity("exclamationmark.shield",
+                                      "Ignoring input from an unapproved device (\(box.deviceID ?? "unknown"))")
+                }
                 return
             }
             // Explicit goodbye from the phone's Disconnect button: tear down
@@ -685,6 +699,15 @@ final class NetworkManager {
                         try self.eventInjector.mouseButtonUp(kind: kind)
                     } catch {
                         self.sendError("mouse_up failed: \(error.localizedDescription)", to: connection)
+                    }
+                    // Same focus check as mouse_click. A Hand Mouse pinch, a
+                    // Live Screen touch, and drag-lock all click via
+                    // down/up rather than mouse_click, so gating this on
+                    // mouse_click alone meant the auto keyboard never rose for
+                    // any of them.
+                    if kind == .left {
+                        self.checkTextFieldFocus(after: 0.25, connection: connection)
+                        self.checkTextFieldFocus(after: 1.0, connection: connection)
                     }
                 }
             case "mouse_click":
@@ -1712,7 +1735,8 @@ private extension NetworkManager {
             // full-screen-app Spaces so the Desktop buttons land on real
             // desktops instead of cycling through every maximized app.
             let step = offset > 0 ? 1 : -1
-            var pos = currentPos + step
+            let neighbourPos = currentPos + step
+            var pos = neighbourPos
             var target: [String: Any]?
             while pos >= 0 && pos < desktops.count {
                 let candidate = desktops[pos]
@@ -1723,14 +1747,22 @@ private extension NetworkManager {
                 }
                 pos += step
             }
+            // Skipping full-screen apps is a preference, not a prohibition.
+            // Treating it as absolute meant that when everything in that
+            // direction was full-screen the button did nothing at all — you
+            // could neither reach those apps nor tell whether the button was
+            // broken. Fall back to the immediate neighbour, whatever it is.
+            var landedOnFullscreen = false
+            if target == nil, neighbourPos >= 0, neighbourPos < desktops.count {
+                target = desktops[neighbourPos]
+                landedOnFullscreen = true
+            }
             let current = currentEntry["index"] as? Int ?? 0
             // No wrap-around: stay put at the edges, matching native behavior.
             guard let target, let id = target["id"] as? String else {
-                print("[NetworkManager] switchSpace: no eligible Space beyond index \(current) on display \(display) (have \(desktops.count))")
-                if skipFullscreen {
-                    emitActivity("rectangle.righthalf.inset.filled.arrow.right",
-                                 "No regular desktop \(offset > 0 ? "to the right" : "to the left") of \(current) on this screen — only full-screen apps")
-                }
+                print("[NetworkManager] switchSpace: nothing beyond index \(current) on display \(display) (have \(desktops.count))")
+                emitActivity("rectangle.righthalf.inset.filled.arrow.right",
+                             "Already at the \(offset > 0 ? "last" : "first") space on this screen (\(current))")
                 return
             }
             let targetIndex = target["index"] as? Int ?? 0
@@ -1745,12 +1777,21 @@ private extension NetworkManager {
                     let disp = d["display"] as? Int ?? 1
                     return "\(i)\(fs ? "F" : "D")\(disp > 1 ? "·\(disp)" : "")"
                 }.joined(separator: " ")
+                let note = landedOnFullscreen ? " — only full-screen apps that way, so went to one" : ""
                 emitActivity("rectangle.righthalf.inset.filled.arrow.right",
-                             "Desktop hop \(current)→\(targetIndex) (screen \(display)) [\(kinds)]")
+                             "Desktop hop \(current)→\(targetIndex) (screen \(display))\(note) [\(kinds)]")
             }
         } catch {
-            // SkyLight unavailable; fall back to the keyboard shortcut.
+            // SkyLight unavailable; fall back to the keyboard shortcut. This is
+            // worth surfacing, not just printing: Ctrl+Arrow does whatever the
+            // front app has bound to it if "Move left/right a space" is turned
+            // off in Keyboard Shortcuts, which is how a desktop switch turns
+            // into an app or tab switch. Seeing this line in Activity is the
+            // difference between diagnosing that and guessing at it.
             print("[NetworkManager] switchSpace falling back to Ctrl+Arrow: \(error)")
+            emitActivity("exclamationmark.arrow.triangle.2.circlepath",
+                         "Space switching unavailable (\(error)) — used Ctrl+Arrow instead, "
+                         + "which needs Mission Control shortcuts enabled")
             try? eventInjector.handleSwipe(fingers: fallbackFingers, direction: offset > 0 ? "right" : "left")
         }
     }

@@ -20,12 +20,56 @@ struct ActivityEntry: Identifiable, Equatable {
     let text: String
 }
 
+/// Delivers a pairing decision to everyone waiting on it, exactly once.
+///
+/// A CheckedContinuation traps the whole process if it is resumed twice, and
+/// there are several ways that happened here: a second press of Allow before
+/// the sheet finished dismissing, and a first connection that asks twice (the
+/// phone sends `hello` with an unknown device ID *and* a `pair_request` when it
+/// holds no key for this Mac), which put two continuations behind one prompt.
+///
+/// Just as bad was the opposite failure: a continuation that was never resumed
+/// at all, because a second request overwrote `pendingPairRequest` and orphaned
+/// the first. That connection then waited forever without ever being
+/// authenticated — and since unauthenticated messages are dropped silently, the
+/// phone showed "connected" while every command went in the bin.
+///
+/// Both stop being possible if "resume exactly once, and resume everyone" is a
+/// property of this type rather than something each call site has to get right.
+@MainActor
+final class PairDecision {
+    private var waiting: [CheckedContinuation<Bool, Never>] = []
+    private var decision: Bool?
+
+    var isDecided: Bool { decision != nil }
+
+    func add(_ continuation: CheckedContinuation<Bool, Never>) {
+        if let decision {
+            continuation.resume(returning: decision)   // already answered
+        } else {
+            waiting.append(continuation)
+        }
+    }
+
+    /// Returns false if a decision had already been delivered, so callers can
+    /// tell a real answer from a duplicate.
+    @discardableResult
+    func resume(_ allowed: Bool) -> Bool {
+        guard decision == nil else { return false }
+        decision = allowed
+        let pending = waiting
+        waiting.removeAll()
+        for continuation in pending { continuation.resume(returning: allowed) }
+        return true
+    }
+}
+
 /// Represents a first-time pairing request from an unknown device.
 struct PairRequest: Identifiable {
     let id = UUID()
     let deviceID: String
     let proposedSecret: Data
-    let continuation: CheckedContinuation<Bool, Never>
+    let decision: PairDecision
 }
 
 /// Represents a connected device and when it connected.
@@ -354,22 +398,61 @@ final class AppState: ObservableObject {
 
     func promptPairing(deviceID: String, proposedSecret: Data) async -> Bool {
         await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
-            let request = PairRequest(deviceID: deviceID, proposedSecret: proposedSecret, continuation: continuation)
-            pendingPairRequest = request
+            if let pending = pendingPairRequest,
+               pending.deviceID == deviceID,
+               pending.proposedSecret == proposedSecret {
+                // The same connection asking a second time: a first-time
+                // connection sends `hello` with an unknown device ID and then a
+                // `pair_request`, and both raise a prompt. Show one, and let a
+                // single Allow answer everyone waiting behind it.
+                pending.decision.add(continuation)
+                return
+            }
+            if let stale = pendingPairRequest {
+                // A different device (or a different connection from the same
+                // one) is taking over the prompt. Deny the old request rather
+                // than dropping it on the floor — an orphaned continuation
+                // leaves its connection unauthenticated forever, and
+                // unauthenticated messages are discarded without a word, so the
+                // phone sits there looking connected and doing nothing.
+                stale.decision.resume(false)
+            }
+            let decision = PairDecision()
+            decision.add(continuation)
+            pendingPairRequest = PairRequest(deviceID: deviceID,
+                                             proposedSecret: proposedSecret,
+                                             decision: decision)
         }
     }
 
     func handlePairingDecision(allowed: Bool, request: PairRequest) async {
-        pendingPairRequest = nil
-        request.continuation.resume(returning: allowed)
+        // A second press of Allow, or a decision for a request that was already
+        // superseded, must not reach the continuation twice.
+        guard !request.decision.isDecided else { return }
+
+        // Persist BEFORE answering. Resuming first tells the phone it is paired
+        // and lets it reconnect while this side still has no secret — which
+        // lands it straight back on "unknown device", the loop that made
+        // Forget-and-retry necessary. A Keychain failure has to deny, not
+        // hand out a pairing this Mac cannot honour.
+        var granted = allowed
         if allowed {
             do {
                 try securityManager.storeSharedSecret(request.proposedSecret, for: request.deviceID)
-                statusMessage = "Paired with \(displayName(for: request.deviceID))"
-                logActivity("checkmark.seal", "Paired \(displayName(for: request.deviceID))")
             } catch {
+                granted = false
                 statusMessage = "Keychain error: \(error.localizedDescription)"
+                logActivity("xmark.seal", "Pairing failed: \(error.localizedDescription)")
             }
+        }
+
+        guard request.decision.resume(granted) else { return }
+        if pendingPairRequest?.id == request.id { pendingPairRequest = nil }
+        if granted {
+            statusMessage = "Paired with \(displayName(for: request.deviceID))"
+            logActivity("checkmark.seal", "Paired \(displayName(for: request.deviceID))")
+        } else if allowed {
+            // Denied only because the Keychain write failed; already logged.
         } else {
             statusMessage = "Connection denied for \(displayName(for: request.deviceID))"
             logActivity("xmark.seal", "Denied pairing for \(displayName(for: request.deviceID))")

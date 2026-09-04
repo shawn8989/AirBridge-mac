@@ -294,6 +294,10 @@ private struct SetupChecklist: View {
                 }
             }
 
+            if runningTranslocated {
+                translocationWarning
+            }
+
             checklistRow(done: appState.accessibilityOK,
                          title: "Allow Wield Host to control this Mac",
                          subtitle: "System Settings → Privacy & Security → Accessibility") {
@@ -323,6 +327,36 @@ private struct SetupChecklist: View {
                     .controlSize(.small)
             }
         }
+    }
+
+    /// macOS runs a downloaded app from a randomized read-only copy until it is
+    /// moved to Applications ("app translocation"). Accessibility granted to
+    /// that copy is silently discarded — and because moving the cursor needs no
+    /// permission at all, the app looks perfectly connected while every click
+    /// and keystroke is dropped. It is the single most confusing way this app
+    /// can fail, so say so before the user spends an hour on it.
+    private var runningTranslocated: Bool {
+        Bundle.main.bundlePath.contains("/AppTranslocation/")
+    }
+
+    private var translocationWarning: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Move Wield Host to your Applications folder")
+                    .font(.subheadline.weight(.semibold))
+                Text("It is running from a temporary copy, so macOS will discard the "
+                     + "permissions below no matter how many times you grant them. "
+                     + "Quit, drag the app to Applications, and open it from there.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+        }
+        .padding(10)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
     }
 
     private func checklistRow<Trailing: View>(done: Bool, title: String, subtitle: String,
@@ -529,6 +563,13 @@ struct PairingPromptView: View {
     let request: PairRequest
     let onDecision: (Bool) -> Void
 
+    /// The sheet does not disappear on the same runloop turn as the tap, so
+    /// without this both buttons stay live during the dismissal. The model is
+    /// now safe against a second decision anyway, but a button that visibly
+    /// does nothing on the second press is better than one that silently
+    /// swallows it.
+    @State private var decided = false
+
     var body: some View {
         VStack(spacing: 16) {
             Image(systemName: "iphone.radiowaves.left.and.right")
@@ -545,15 +586,22 @@ struct PairingPromptView: View {
                 .foregroundStyle(.tertiary)
                 .multilineTextAlignment(.center)
             HStack(spacing: 12) {
-                Button("Deny") { onDecision(false) }
+                Button("Deny") { decide(false) }
                     .keyboardShortcut(.cancelAction)
-                Button("Allow") { onDecision(true) }
+                Button("Allow") { decide(true) }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
             }
+            .disabled(decided)
         }
         .padding(24)
         .frame(minWidth: 340)
+    }
+
+    private func decide(_ allowed: Bool) {
+        guard !decided else { return }
+        decided = true
+        onDecision(allowed)
     }
 }
 
