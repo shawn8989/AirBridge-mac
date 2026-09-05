@@ -295,8 +295,18 @@ final class NetworkManager {
     }
 
     private func handle(connection: NWConnection) {
-        // Enforce LAN by checking endpoint is host and in local interface
-        guard case let .hostPort(host, _) = connection.endpoint, host.debugDescription.contains(".") || true else {
+        // NOTE: there is deliberately no address-based filter here.
+        //
+        // What used to be here read as a LAN check but ended in `|| true`, so it
+        // accepted everything while looking like it did not -- worse than no
+        // check at all, because it invited the reader to stop worrying. A real
+        // filter is also not wanted: connecting by address over a VPN or
+        // Tailscale is a supported, documented path, and those peers are not on
+        // a local subnet.
+        //
+        // Authorization is the app-layer HMAC challenge below; reaching this
+        // point grants nothing on its own.
+        guard case .hostPort = connection.endpoint else {
             connection.cancel(); return
         }
 
@@ -346,6 +356,19 @@ final class NetworkManager {
         queue.async { [weak self] in self?.eventInjector.releaseAllModifiers() }
     }
 
+    /// Releases held input on the CALLING thread, for shutdown paths where
+    /// there may be no next runloop turn.
+    ///
+    /// The async version hops onto `queue`, and the caller then slept 150ms
+    /// hoping it landed. If `queue` was inside typeText's usleep loop -- up to
+    /// a quarter-second per 1000 characters -- it did not, and the process died
+    /// with a modifier latched. Posting the events here always beats the exit.
+    /// Safe to race with the queue: releasing twice is harmless, never
+    /// releasing is not.
+    func emergencyReleaseInputSynchronously() {
+        eventInjector.releaseAllModifiers()
+    }
+
     // Reaps half-open connections: a phone that vanished (Wi-Fi drop, app
     // killed) never sends a FIN, so without this the dashboard says
     // "connected" forever and latched input is never released.
@@ -375,6 +398,16 @@ final class NetworkManager {
             if let data, !data.isEmpty {
                 box.lastRXAt = CFAbsoluteTimeGetCurrent()
                 box.buffer.append(data)
+        // A peer streaming bytes with no newline would otherwise grow this
+        // forever, and the reaper cannot help because lastRXAt stays fresh.
+        // No authentication is required to reach here.
+        if box.buffer.count > Self.maxLineBufferBytes {
+            print("[Wield Host] Line buffer overflow (\(box.buffer.count) bytes) — dropping connection")
+            emitActivity("exclamationmark.triangle", "Dropped a connection sending an oversized message")
+            teardown(connection, reason: "line buffer overflow")
+            connection.cancel()
+            return
+        }
                 // Process complete lines (\n-delimited)
                 while let newlineIndex = box.buffer.firstIndex(of: 0x0A) { // 0x0A = \n
                     let lineData = box.buffer.prefix(upTo: newlineIndex)
@@ -400,6 +433,38 @@ final class NetworkManager {
         "mouse_move", "mouse_move_abs", "scroll", "mouse_click", "mouse_down", "mouse_up",
         "key_down", "key_up", "key_combo", "swipe", "action", "nav", "pinch", "media", "type_text"
     ]
+    /// Compares two authentication tags without short-circuiting on the first
+    /// differing byte, so the comparison time carries no information about how
+    /// much of a guess was correct.
+    static func constantTimeEquals(_ a: Data, _ b: Data) -> Bool {
+        guard a.count == b.count else { return false }
+        var difference: UInt8 = 0
+        for (x, y) in zip(a, b) { difference |= x ^ y }
+        return difference == 0
+    }
+
+    /// Ceiling on one un-terminated NDJSON line. The largest legitimate message
+    /// is a base64 Live Screen frame, comfortably under this.
+    static let maxLineBufferBytes = 4 * 1024 * 1024
+
+    /// Validates a client-supplied keycode. CGKeyCode is UInt16 and the
+    /// conversion TRAPS, so an out-of-range value from JSON crashed the host —
+    /// and a crash skips the terminate handler, leaving held keys latched.
+    /// macOS virtual keycodes live in 0...127.
+    static func virtualKey(from raw: Any?) -> CGKeyCode? {
+        let value: Int?
+        switch raw {
+        case let v as Int:    value = v
+        case let v as UInt64: value = v <= 127 ? Int(v) : nil
+        case let v as Double: value = v.isFinite ? Int(v) : nil
+        default:              value = nil
+        }
+        guard let value, (0...127).contains(value) else { return nil }
+        return CGKeyCode(value)
+    }
+
+    /// Never suppressed by Pause Input: see the gate in handleLine.
+    private static let releaseTypes: Set<String> = ["mouse_up", "key_up"]
     // Written on `queue` via setInputPaused; read on `queue` in handleLine.
     private var inputPaused = false
     // Last known "focus is in a text field" state (queue-confined), so the
@@ -415,7 +480,14 @@ final class NetworkManager {
 
     /// Thread-safe toggle for suppressing input injection (menu bar / window).
     func setInputPaused(_ paused: Bool) {
-        queue.async { [weak self] in self?.inputPaused = paused }
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.inputPaused = paused
+            // Pausing while something is held would strand it: the phone's
+            // matching up-event may already be in flight, and anything held now
+            // is held until the connection dies. Let go on the way in.
+            if paused { self.eventInjector.releaseAllModifiers() }
+        }
     }
 
     // MARK: - UI feed (all callbacks delivered on main)
@@ -460,7 +532,18 @@ final class NetworkManager {
             } else {
                 self.listener?.cancel()
                 self.listener = nil
-                for (_, connection) in self.activeConnections { connection.cancel() }
+                // Tear each connection down PROPERLY before cancelling it.
+                // Clearing connectionBoxes here instead meant the .cancelled
+                // callback -- delivered later on this same serial queue -- hit
+                // teardown's `guard let box = connectionBoxes[key]` and returned
+                // immediately: no releaseAllModifiers (so a drag in progress
+                // stayed latched on the user's physical mouse), no
+                // stopVideoStream (so the capture and focus timers kept firing
+                // against a dead connection forever).
+                for (_, connection) in self.activeConnections {
+                    self.teardown(connection, reason: "server disabled")
+                    connection.cancel()
+                }
                 self.activeConnections.removeAll()
                 self.connectionBoxes.removeAll()
             }
@@ -514,7 +597,10 @@ final class NetworkManager {
             // challenge-response below. Only handshake messages are allowed
             // before authentication, so an unauthenticated peer can neither
             // inject input nor read system/app information.
-            let openTypes: Set<String> = ["hello", "pair_request", "auth_proof", "bye"]
+            // `bye` is deliberately NOT here: it runs teardown, which releases
+            // input and stops the video stream process-wide, so an unauthenticated
+            // peer could end a legitimate session's drag and kill its stream.
+            let openTypes: Set<String> = ["hello", "pair_request", "auth_proof"]
             if !openTypes.contains(type) && !box.authenticated {
                 // Dropping these silently is what made a half-finished pairing
                 // look like a working connection: the phone reported connected
@@ -538,7 +624,12 @@ final class NetworkManager {
             // User-controlled "Pause Input": drop injection messages while
             // paused, but keep handshake, heartbeat, clipboard, and queries
             // working so the connection stays healthy.
-            if self.inputPaused && Self.inputTypes.contains(type) {
+            // Up-events are exempt: dropping a mouse_up or key_up leaves the
+            // button or modifier latched in the window server, which breaks the
+            // user's PHYSICAL mouse and keyboard until reboot. Unpausing cannot
+            // repair it either, because the phone already sent the up.
+            if self.inputPaused && Self.inputTypes.contains(type)
+                && !Self.releaseTypes.contains(type) {
                 return
             }
             // Live metrics for the dashboard (counted only when executed).
@@ -551,6 +642,16 @@ final class NetworkManager {
             }
             switch type {
             case "hello":
+                // A second hello on an ALREADY AUTHENTICATED connection used to
+                // rewrite its identity to anything it liked, which corrupted the
+                // metrics and Activity attribution and let one connection's
+                // disconnect remove a different device's row from the dashboard.
+                // Re-introducing yourself after authenticating is not a thing a
+                // legitimate client does.
+                if box.authenticated, box.deviceID != nil {
+                    self.sendError("hello after authentication is not allowed", to: connection)
+                    break
+                }
                 if let payload = dict["payload"] as? [String: Any], let deviceID = payload["deviceID"] as? String {
                     box.deviceID = deviceID
                     if let name = payload["deviceName"] as? String, !name.isEmpty {
@@ -594,9 +695,20 @@ final class NetworkManager {
                        let proof = Data(base64Encoded: proofB64),
                        let qr = self.activeQRSecret, Date() < qr.expires {
                         let expected = self.security.computeHMAC(secret: qr.secret, data: Data(deviceID.utf8))
-                        if expected == proof {
+                        if Self.constantTimeEquals(expected, proof) {
                             let derived = self.security.deriveQRPairSecret(qrSecret: qr.secret, deviceID: deviceID)
-                            try? self.security.storeSharedSecret(derived, for: deviceID)
+                            // A Keychain failure must DENY. Storing nothing while
+                            // authenticating and reporting success left the phone
+                            // believing it was paired and this Mac with no secret,
+                            // so the next connection was an unknown device again.
+                            do {
+                                try self.security.storeSharedSecret(derived, for: deviceID)
+                            } catch {
+                                self.sendError("Could not save the pairing: \(error.localizedDescription)", to: connection)
+                                self.emitActivity("xmark.seal", "QR pairing failed to save — not paired")
+                                connection.cancel()
+                                break
+                            }
                             self.activeQRSecret = nil  // one-time use
                             box.authenticated = true
                             self.sendLine(connection, jsonObject: ["type": "pair_qr_ok", "payload": [:]])
@@ -667,7 +779,7 @@ final class NetworkManager {
                     break
                 }
                 let expected = self.security.computeHMAC(secret: secret, data: nonce)
-                if expected == proof {
+                if Self.constantTimeEquals(expected, proof) {
                     box.authenticated = true
                     box.authNonce = nil
                     self.onDeviceConnected(deviceID)
@@ -728,7 +840,9 @@ final class NetworkManager {
                 // A key with explicit modifiers (keyboard accessory bar shortcuts).
                 if let payload = dict["payload"] as? [String: Any] {
                     let keyCode = (payload["keyCode"] as? Int) ?? Int(payload["keyCode"] as? Double ?? -1)
-                    if keyCode >= 0 {
+                    // Upper bound matters as much as the lower one: CGKeyCode is
+                    // UInt16 and the conversion traps, so 99999 killed the host.
+                    if keyCode >= 0 && keyCode <= 127 {
                         try? self.eventInjector.pressKeyCombo(
                             CGKeyCode(keyCode),
                             command: payload["command"] as? Bool ?? false,
@@ -760,11 +874,13 @@ final class NetworkManager {
                     } else if let dxI = payload["dx"] as? Int, let dyI = payload["dy"] as? Int {
                         dxVal = Double(dxI); dyVal = Double(dyI)
                     }
-                    if let dx = dxVal, let dy = dyVal {
-                        var totalX = box.scrollAccumX + dx
-                        var totalY = box.scrollAccumY + dy
-                        let intX = Int32(totalX.rounded(.towardZero))
-                        let intY = Int32(totalY.rounded(.towardZero))
+                    if let dx = dxVal, let dy = dyVal, dx.isFinite, dy.isFinite {
+                        // Accumulators must stay finite too — a single huge delta
+                        // would otherwise poison them for the whole connection.
+                        var totalX = (box.scrollAccumX + dx).clampedToScrollRange
+                        var totalY = (box.scrollAccumY + dy).clampedToScrollRange
+                        let intX = EventInjector.clampToInt32(totalX.rounded(.towardZero))
+                        let intY = EventInjector.clampToInt32(totalY.rounded(.towardZero))
                         totalX -= Double(intX)
                         totalY -= Double(intY)
                         box.scrollAccumX = totalX
@@ -775,16 +891,14 @@ final class NetworkManager {
                     }
                 }
             case "key_down":
-                if let payload = dict["payload"] as? [String: Any], let keyCode = payload["keyCode"] as? UInt64 {
-                    try? self.eventInjector.keyDown(keyCode: CGKeyCode(keyCode))
-                } else if let payload = dict["payload"] as? [String: Any], let keyCodeInt = payload["keyCode"] as? Int {
-                    try? self.eventInjector.keyDown(keyCode: CGKeyCode(keyCodeInt))
+                if let payload = dict["payload"] as? [String: Any],
+                   let code = Self.virtualKey(from: payload["keyCode"]) {
+                    try? self.eventInjector.keyDown(keyCode: code)
                 }
             case "key_up":
-                if let payload = dict["payload"] as? [String: Any], let keyCode = payload["keyCode"] as? UInt64 {
-                    try? self.eventInjector.keyUp(keyCode: CGKeyCode(keyCode))
-                } else if let payload = dict["payload"] as? [String: Any], let keyCodeInt = payload["keyCode"] as? Int {
-                    try? self.eventInjector.keyUp(keyCode: CGKeyCode(keyCodeInt))
+                if let payload = dict["payload"] as? [String: Any],
+                   let code = Self.virtualKey(from: payload["keyCode"]) {
+                    try? self.eventInjector.keyUp(keyCode: code)
                 }
             case "swipe":
                 if let payload = dict["payload"] as? [String: Any] {
@@ -1868,7 +1982,26 @@ private extension NetworkManager {
             }
         }
         guard let element else { return (false, "no focused element readable") }
-        return (elementIsTextInput(element), roleDescription(of: element))
+        if elementIsTextInput(element) { return (true, roleDescription(of: element)) }
+
+        // The system-wide query often SUCCEEDS while returning something useless
+        // -- a window, typically, which is what the Activity log showed as
+        // "AXWindow/AXStandardWindow" while the auto keyboard refused to rise.
+        // Gating the per-app query on the system-wide one *failing* meant the
+        // better answer was never asked for. Ask now, and take it if it is
+        // better; a real text field beats a window every time.
+        if let app = NSWorkspace.shared.frontmostApplication {
+            let appElement = AXUIElementCreateApplication(app.processIdentifier)
+            var appFocusedRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &appFocusedRef) == .success,
+               let raw = appFocusedRef, CFGetTypeID(raw) == AXUIElementGetTypeID() {
+                let appFocused = unsafeDowncast(raw as AnyObject, to: AXUIElement.self)
+                if elementIsTextInput(appFocused) {
+                    return (true, roleDescription(of: appFocused) + " via app")
+                }
+            }
+        }
+        return (false, roleDescription(of: element))
     }
 
     private static func roleDescription(of element: AXUIElement) -> String {

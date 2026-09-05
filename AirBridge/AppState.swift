@@ -178,11 +178,25 @@ final class AppState: ObservableObject {
         // keyboard/mouse misbehave until reboot. Always release on exit.
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
                                                object: nil, queue: .main) { [weak self] _ in
-            self?.networkManager.emergencyReleaseInput()
-            // Give the async release a beat to post before the process dies.
-            Thread.sleep(forTimeInterval: 0.15)
+            self?.networkManager.emergencyReleaseInputSynchronously()
         }
+
+        // willTerminate is NOT delivered on force-quit, on logout-kill, or when
+        // launchd stops us -- which is exactly when input is most likely to be
+        // latched, because those are the ways you kill an app that is
+        // misbehaving. A signal handler covers what the notification cannot.
+        let manager = networkManager
+        Self.terminationSignalSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        Self.terminationSignalSource?.setEventHandler {
+            manager.emergencyReleaseInputSynchronously()
+            exit(0)
+        }
+        Self.terminationSignalSource?.resume()
+        signal(SIGTERM, SIG_IGN)   // the DispatchSource handles it instead
     }
+
+    /// Held for the process lifetime; a released source stops delivering.
+    private static var terminationSignalSource: DispatchSourceSignal?
 
     private var updateCancellable: AnyCancellable?
 
