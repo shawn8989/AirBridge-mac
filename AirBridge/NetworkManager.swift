@@ -52,7 +52,15 @@ private final class ScreenCaptureHelper: NSObject, SCStreamOutput, SCStreamDeleg
     private var sampleBufferDisplayLayer = AVSampleBufferDisplayLayer()
     private let queue = DispatchQueue(label: "Wield Host.ScreenCapture")
     weak var consumer: ScreenFrameConsumer?
-    private(set) var lastFrame: CGImage?
+    /// Written on the capture queue, read from anywhere. An unsynchronised
+    /// store/load of a reference-counted CGImage? is a real race: ARC can
+    /// over-release the frame being swapped out.
+    private let frameLock = NSLock()
+    private var _lastFrame: CGImage?
+    var lastFrame: CGImage? {
+        get { frameLock.lock(); defer { frameLock.unlock() }; return _lastFrame }
+        set { frameLock.lock(); _lastFrame = newValue; frameLock.unlock() }
+    }
 
     func start() async throws {
         let content = try await SCShareableContent.current
@@ -118,7 +126,15 @@ final class NetworkManager {
     private var isSendingFrame = false
     #if os(macOS)
     private var screenCapture: ScreenCaptureHelper?
-    private var latestCapturedImage: CGImage?
+    /// Written on the ScreenCapture queue by didProduceFrame, read on `queue`
+    /// by the video timer and the one-shot capture path. Locked for the same
+    /// reason as ScreenCaptureHelper.lastFrame.
+    private let capturedImageLock = NSLock()
+    private var _latestCapturedImage: CGImage?
+    private var latestCapturedImage: CGImage? {
+        get { capturedImageLock.lock(); defer { capturedImageLock.unlock() }; return _latestCapturedImage }
+        set { capturedImageLock.lock(); _latestCapturedImage = newValue; capturedImageLock.unlock() }
+    }
     #endif
 
     init(onReceivePacket: @escaping PacketHandler,
@@ -442,6 +458,9 @@ final class NetworkManager {
         for (x, y) in zip(a, b) { difference |= x ^ y }
         return difference == 0
     }
+
+    /// Last Now Playing result and when it was taken (queue-confined).
+    private var cachedNowPlaying: (payload: [String: Any], at: CFTimeInterval)?
 
     /// Ceiling on one un-terminated NDJSON line. The largest legitimate message
     /// is a base64 Live Screen frame, comfortably under this.
@@ -959,11 +978,26 @@ final class NetworkManager {
                 #endif
             case "now_playing_get":
                 // Current track (Music/Spotify) + system volume for the phone's
-                // media screen. NSAppleScript must run on the main thread.
+                // media screen. NSAppleScript must run on the main thread, and
+                // fetchNowPlaying runs up to four scripts against Music and
+                // Spotify — so a client polling this (the phone's media screen
+                // polls every 3s) blocks the UI thread each time, and a busy
+                // music app or an Automation prompt blocks it for much longer.
+                //
+                // Cache briefly so the cost is bounded no matter how fast a
+                // client asks. Moving NSAppleScript off the main thread would be
+                // the real fix, but it risks a working feature that cannot be
+                // verified from here; tracked for 1.1.
+                if let cached = self.cachedNowPlaying,
+                   CACurrentMediaTime() - cached.at < 1.0 {
+                    self.sendLine(connection, jsonObject: ["type": "now_playing", "payload": cached.payload])
+                    break
+                }
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     let payload = self.fetchNowPlaying()
                     self.queue.async {
+                        self.cachedNowPlaying = (payload, CACurrentMediaTime())
                         self.sendLine(connection, jsonObject: ["type": "now_playing", "payload": payload])
                     }
                 }
@@ -1199,10 +1233,14 @@ final class NetworkManager {
                 guard let payload = dict["payload"] as? [String: Any], let bundleID = payload["bundleIdentifier"] as? String else {
                     self.sendError("request_app_icon missing payload.bundleIdentifier", to: connection); break
                 }
+                // Clamped: unclamped, a client could ask for a 100000x100000
+                // image and make the host allocate gigabytes.
                 let maxSize: Int = {
-                    if let v = payload["maxSize"] as? Int { return v }
-                    if let v = payload["maxSize"] as? Double { return Int(v) }
-                    return 256
+                    let requested: Int
+                    if let v = payload["maxSize"] as? Int { requested = v }
+                    else if let v = payload["maxSize"] as? Double, v.isFinite { requested = Int(v) }
+                    else { requested = 256 }
+                    return min(max(requested, 16), 512)
                 }()
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                     guard let self else { return }
@@ -1214,14 +1252,27 @@ final class NetworkManager {
                         image = ws.icon(forFile: appURL.path)
                     }
                     guard let nsImage = image else { self.sendError("Icon not found for \(bundleID)", to: connection); return }
-                    let targetSize = NSSize(width: maxSize, height: maxSize)
-                    let resized = NSImage(size: targetSize)
-                    resized.lockFocus()
-                    NSGraphicsContext.current?.imageInterpolation = .high
-                    let rect = NSRect(origin: .zero, size: targetSize)
-                    nsImage.draw(in: rect, from: .zero, operation: .copy, fraction: 1.0, respectFlipped: true, hints: nil)
-                    resized.unlockFocus()
-                    guard let tiff = resized.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff), let pngData = rep.representation(using: .png, properties: [:]) else {
+                    // CGContext, not NSImage.lockFocus(): lockFocus and the
+                    // NSGraphicsContext current-context stack are main-thread-only
+                    // AppKit, and this runs on a global queue. Off-main use is
+                    // undefined — in practice blank or corrupted icons, and it can
+                    // crash. jpegData already takes this approach.
+                    var rect = CGRect(x: 0, y: 0, width: maxSize, height: maxSize)
+                    guard let cgSource = nsImage.cgImage(forProposedRect: &rect, context: nil, hints: nil),
+                          let colorSpace = cgSource.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB),
+                          let context = CGContext(data: nil, width: maxSize, height: maxSize,
+                                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                                  space: colorSpace,
+                                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+                        self.sendError("Failed to render icon for \(bundleID)", to: connection); return
+                    }
+                    context.interpolationQuality = .high
+                    context.draw(cgSource, in: CGRect(x: 0, y: 0, width: maxSize, height: maxSize))
+                    guard let scaled = context.makeImage() else {
+                        self.sendError("Failed to render icon for \(bundleID)", to: connection); return
+                    }
+                    let rep = NSBitmapImageRep(cgImage: scaled)
+                    guard let pngData = rep.representation(using: .png, properties: [:]) else {
                         self.sendError("Failed to encode icon for \(bundleID)", to: connection); return
                     }
                     let b64 = pngData.base64EncodedString()
@@ -1541,11 +1592,11 @@ final class NetworkManager {
                         if let v = payload["maxWidth"] as? Double { return Int(v) }
                         return 320
                     }()
-                    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    Task { [weak self] in
                         guard let self else { return }
                         let responseType = "window_thumbnail"
                         var b64: String? = nil
-                        if let n = Int(windowIDStr), let image = self._windowImage(windowNumber: n) {
+                        if let n = Int(windowIDStr), let image = await self._windowImage(windowNumber: n) {
                             if let data = self.jpegData(from: image, maxWidth: maxWidth, quality: 0.8) {
                                 b64 = data.base64EncodedString()
                             }
@@ -1641,13 +1692,18 @@ final class NetworkManager {
         focusTimer.schedule(deadline: .now() + 1, repeating: .seconds(1), leeway: .milliseconds(200))
         focusTimer.setEventHandler { [weak self, weak connection] in
             guard let self, let connection else { return }
-            let focused = Self.focusedElementIsTextInput()
-            if focused != self.lastTextFocusState {
-                self.lastTextFocusState = focused
-                self.sendLine(connection, jsonObject: [
-                    "type": "text_focus",
-                    "payload": ["focused": focused]
-                ])
+            Self.axQueue.async { [weak self, weak connection] in
+                let focused = Self.focusedElementIsTextInput()
+                guard let self, let connection else { return }
+                // lastTextFocusState is queue-confined; hop back to compare it.
+                self.queue.async {
+                    guard focused != self.lastTextFocusState else { return }
+                    self.lastTextFocusState = focused
+                    self.sendLine(connection, jsonObject: [
+                        "type": "text_focus",
+                        "payload": ["focused": focused]
+                    ])
+                }
             }
         }
         focusTimer.resume()
@@ -1938,9 +1994,10 @@ private extension NetworkManager {
     /// on a text field and notifies the phone on CHANGES so it can raise or
     /// lower its keyboard automatically.
     func checkTextFieldFocus(after delay: TimeInterval, connection: NWConnection) {
-        queue.asyncAfter(deadline: .now() + delay) { [weak self, weak connection] in
+        Self.axQueue.asyncAfter(deadline: .now() + delay) { [weak self, weak connection] in
             guard let self, let connection else { return }
             let info = Self.focusedTextInputInfo()
+            self.queue.async {
             self.lastTextFocusState = info.focused
             // Click-driven checks send UNCONDITIONALLY: change-gating here
             // proved fragile (a stale "already focused" suppressed the event
@@ -1955,8 +2012,18 @@ private extension NetworkManager {
                 self.lastFocusDetail = detail
                 self.emitActivity("keyboard", detail)
             }
+            }
         }
     }
+
+    /// Accessibility queries run here, never on `queue`.
+    ///
+    /// AXUIElementCopyAttributeValue against an unresponsive application blocks
+    /// until the AX timeout, and focusedTextInputInfo makes up to five such
+    /// calls. Two are scheduled on every left click. Running them on the network
+    /// serial queue stalled everything it owns for the duration: no input
+    /// injected, no packets read, no teardown, no reaper.
+    private static let axQueue = DispatchQueue(label: "Wield Host.accessibility", qos: .userInitiated)
 
     private static func focusedElementIsTextInput() -> Bool {
         focusedTextInputInfo().focused
@@ -1965,6 +2032,9 @@ private extension NetworkManager {
     /// Focus detection with a diagnostic string (for the Activity log — the
     /// only way to see WHY auto-keyboard didn't fire on a given click).
     static func focusedTextInputInfo() -> (focused: Bool, detail: String) {
+        // Bound how long an unresponsive app can stall us. The default is around
+        // six seconds PER CALL and this function makes several.
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 1.0)
         // The system-wide focused element is flaky for some apps; fall back to
         // asking the frontmost application directly.
         var element: AXUIElement?
@@ -2558,32 +2628,16 @@ private extension NetworkManager {
         ctx.strokePath()
     }
 
-    func _windowImage(windowNumber: Int) -> CGImage? {
-        // Resolve window bounds first
+    /// Async, deliberately. The previous version started `Task { helper.start() }`
+    /// and then blocked its own thread on a DispatchSemaphore waiting for that
+    /// Task — the exact pattern documented above `_captureDisplayOnceAsync` as
+    /// having starved the Swift concurrency pool and hung the app.
+    /// `_captureDisplayOnce` was converted for that reason; this one was left
+    /// behind, so a client asking for several window thumbnails at once could
+    /// still reproduce the original hang.
+    func _windowImage(windowNumber: Int) async -> CGImage? {
         guard let bounds = _windowBounds(windowNumber: windowNumber) else { return nil }
-
-        // Capture a single screen frame using ScreenCaptureKit
-        final class OneShotConsumer: ScreenFrameConsumer {
-            let sema: DispatchSemaphore
-            var image: CGImage?
-            init(sema: DispatchSemaphore) { self.sema = sema }
-            func didProduceFrame(_ image: CGImage) {
-                if self.image == nil { self.image = image; sema.signal() }
-            }
-        }
-
-        let sema = DispatchSemaphore(value: 0)
-        let helper = ScreenCaptureHelper()
-        let consumer = OneShotConsumer(sema: sema)
-        helper.consumer = consumer
-
-        // Start capture asynchronously and wait for first frame (with timeout)
-        Task {
-            do { try await helper.start() } catch { sema.signal() }
-        }
-        let waitResult = sema.wait(timeout: .now() + 2.5)  // cold SCK start takes 1-3s
-        helper.stop()
-        guard waitResult == .success, let frame = consumer.image else { return nil }
+        guard let frame = await _captureDisplayOnceAsync() else { return nil }
 
         // Compute crop rect in pixels (convert from points using backing scale factor)
         let scale = NSScreen.main?.backingScaleFactor ?? 2.0
