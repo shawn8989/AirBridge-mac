@@ -185,7 +185,9 @@ final class AppState: ObservableObject {
         // launchd stops us -- which is exactly when input is most likely to be
         // latched, because those are the ways you kill an app that is
         // misbehaving. A signal handler covers what the notification cannot.
-        let manager = networkManager
+        // Explicitly typed: `networkManager` is declared NetworkManager!, so
+        // binding it without an annotation gives an Optional.
+        let manager: NetworkManager = networkManager
         Self.terminationSignalSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
         Self.terminationSignalSource?.setEventHandler {
             manager.emergencyReleaseInputSynchronously()
