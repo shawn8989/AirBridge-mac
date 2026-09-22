@@ -57,7 +57,7 @@ struct ContentView: View {
         .animation(.snappy(duration: 0.2), value: appState.connectedDevices)
         .sheet(item: $appState.pendingPairRequest) { request in
             PairingPromptView(request: request) { allowed in
-                Task { await appState.handlePairingDecision(allowed: allowed, request: request) }
+                Task { await appState.decideCurrentPairing(allowed: allowed) }
             }
         }
         .sheet(isPresented: Binding(

@@ -52,7 +52,15 @@ private final class ScreenCaptureHelper: NSObject, SCStreamOutput, SCStreamDeleg
     private var sampleBufferDisplayLayer = AVSampleBufferDisplayLayer()
     private let queue = DispatchQueue(label: "Wield Host.ScreenCapture")
     weak var consumer: ScreenFrameConsumer?
-    private(set) var lastFrame: CGImage?
+    /// Written on the capture queue, read from anywhere. An unsynchronised
+    /// store/load of a reference-counted CGImage? is a real race: ARC can
+    /// over-release the frame being swapped out.
+    private let frameLock = NSLock()
+    private var _lastFrame: CGImage?
+    var lastFrame: CGImage? {
+        get { frameLock.lock(); defer { frameLock.unlock() }; return _lastFrame }
+        set { frameLock.lock(); _lastFrame = newValue; frameLock.unlock() }
+    }
 
     func start() async throws {
         let content = try await SCShareableContent.current
@@ -118,7 +126,15 @@ final class NetworkManager {
     private var isSendingFrame = false
     #if os(macOS)
     private var screenCapture: ScreenCaptureHelper?
-    private var latestCapturedImage: CGImage?
+    /// Written on the ScreenCapture queue by didProduceFrame, read on `queue`
+    /// by the video timer and the one-shot capture path. Locked for the same
+    /// reason as ScreenCaptureHelper.lastFrame.
+    private let capturedImageLock = NSLock()
+    private var _latestCapturedImage: CGImage?
+    private var latestCapturedImage: CGImage? {
+        get { capturedImageLock.lock(); defer { capturedImageLock.unlock() }; return _latestCapturedImage }
+        set { capturedImageLock.lock(); _latestCapturedImage = newValue; capturedImageLock.unlock() }
+    }
     #endif
 
     init(onReceivePacket: @escaping PacketHandler,
@@ -295,8 +311,18 @@ final class NetworkManager {
     }
 
     private func handle(connection: NWConnection) {
-        // Enforce LAN by checking endpoint is host and in local interface
-        guard case let .hostPort(host, _) = connection.endpoint, host.debugDescription.contains(".") || true else {
+        // NOTE: there is deliberately no address-based filter here.
+        //
+        // What used to be here read as a LAN check but ended in `|| true`, so it
+        // accepted everything while looking like it did not -- worse than no
+        // check at all, because it invited the reader to stop worrying. A real
+        // filter is also not wanted: connecting by address over a VPN or
+        // Tailscale is a supported, documented path, and those peers are not on
+        // a local subnet.
+        //
+        // Authorization is the app-layer HMAC challenge below; reaching this
+        // point grants nothing on its own.
+        guard case .hostPort = connection.endpoint else {
             connection.cancel(); return
         }
 
@@ -346,6 +372,19 @@ final class NetworkManager {
         queue.async { [weak self] in self?.eventInjector.releaseAllModifiers() }
     }
 
+    /// Releases held input on the CALLING thread, for shutdown paths where
+    /// there may be no next runloop turn.
+    ///
+    /// The async version hops onto `queue`, and the caller then slept 150ms
+    /// hoping it landed. If `queue` was inside typeText's usleep loop -- up to
+    /// a quarter-second per 1000 characters -- it did not, and the process died
+    /// with a modifier latched. Posting the events here always beats the exit.
+    /// Safe to race with the queue: releasing twice is harmless, never
+    /// releasing is not.
+    func emergencyReleaseInputSynchronously() {
+        eventInjector.releaseAllModifiers()
+    }
+
     // Reaps half-open connections: a phone that vanished (Wi-Fi drop, app
     // killed) never sends a FIN, so without this the dashboard says
     // "connected" forever and latched input is never released.
@@ -375,6 +414,16 @@ final class NetworkManager {
             if let data, !data.isEmpty {
                 box.lastRXAt = CFAbsoluteTimeGetCurrent()
                 box.buffer.append(data)
+        // A peer streaming bytes with no newline would otherwise grow this
+        // forever, and the reaper cannot help because lastRXAt stays fresh.
+        // No authentication is required to reach here.
+        if box.buffer.count > Self.maxLineBufferBytes {
+            print("[Wield Host] Line buffer overflow (\(box.buffer.count) bytes) — dropping connection")
+            emitActivity("exclamationmark.triangle", "Dropped a connection sending an oversized message")
+            teardown(connection, reason: "line buffer overflow")
+            connection.cancel()
+            return
+        }
                 // Process complete lines (\n-delimited)
                 while let newlineIndex = box.buffer.firstIndex(of: 0x0A) { // 0x0A = \n
                     let lineData = box.buffer.prefix(upTo: newlineIndex)
@@ -400,6 +449,41 @@ final class NetworkManager {
         "mouse_move", "mouse_move_abs", "scroll", "mouse_click", "mouse_down", "mouse_up",
         "key_down", "key_up", "key_combo", "swipe", "action", "nav", "pinch", "media", "type_text"
     ]
+    /// Compares two authentication tags without short-circuiting on the first
+    /// differing byte, so the comparison time carries no information about how
+    /// much of a guess was correct.
+    static func constantTimeEquals(_ a: Data, _ b: Data) -> Bool {
+        guard a.count == b.count else { return false }
+        var difference: UInt8 = 0
+        for (x, y) in zip(a, b) { difference |= x ^ y }
+        return difference == 0
+    }
+
+    /// Last Now Playing result and when it was taken (queue-confined).
+    private var cachedNowPlaying: (payload: [String: Any], at: CFTimeInterval)?
+
+    /// Ceiling on one un-terminated NDJSON line. The largest legitimate message
+    /// is a base64 Live Screen frame, comfortably under this.
+    static let maxLineBufferBytes = 4 * 1024 * 1024
+
+    /// Validates a client-supplied keycode. CGKeyCode is UInt16 and the
+    /// conversion TRAPS, so an out-of-range value from JSON crashed the host —
+    /// and a crash skips the terminate handler, leaving held keys latched.
+    /// macOS virtual keycodes live in 0...127.
+    static func virtualKey(from raw: Any?) -> CGKeyCode? {
+        let value: Int?
+        switch raw {
+        case let v as Int:    value = v
+        case let v as UInt64: value = v <= 127 ? Int(v) : nil
+        case let v as Double: value = v.isFinite ? Int(v) : nil
+        default:              value = nil
+        }
+        guard let value, (0...127).contains(value) else { return nil }
+        return CGKeyCode(value)
+    }
+
+    /// Never suppressed by Pause Input: see the gate in handleLine.
+    private static let releaseTypes: Set<String> = ["mouse_up", "key_up"]
     // Written on `queue` via setInputPaused; read on `queue` in handleLine.
     private var inputPaused = false
     // Last known "focus is in a text field" state (queue-confined), so the
@@ -415,7 +499,14 @@ final class NetworkManager {
 
     /// Thread-safe toggle for suppressing input injection (menu bar / window).
     func setInputPaused(_ paused: Bool) {
-        queue.async { [weak self] in self?.inputPaused = paused }
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.inputPaused = paused
+            // Pausing while something is held would strand it: the phone's
+            // matching up-event may already be in flight, and anything held now
+            // is held until the connection dies. Let go on the way in.
+            if paused { self.eventInjector.releaseAllModifiers() }
+        }
     }
 
     // MARK: - UI feed (all callbacks delivered on main)
@@ -460,7 +551,18 @@ final class NetworkManager {
             } else {
                 self.listener?.cancel()
                 self.listener = nil
-                for (_, connection) in self.activeConnections { connection.cancel() }
+                // Tear each connection down PROPERLY before cancelling it.
+                // Clearing connectionBoxes here instead meant the .cancelled
+                // callback -- delivered later on this same serial queue -- hit
+                // teardown's `guard let box = connectionBoxes[key]` and returned
+                // immediately: no releaseAllModifiers (so a drag in progress
+                // stayed latched on the user's physical mouse), no
+                // stopVideoStream (so the capture and focus timers kept firing
+                // against a dead connection forever).
+                for (_, connection) in self.activeConnections {
+                    self.teardown(connection, reason: "server disabled")
+                    connection.cancel()
+                }
                 self.activeConnections.removeAll()
                 self.connectionBoxes.removeAll()
             }
@@ -514,7 +616,10 @@ final class NetworkManager {
             // challenge-response below. Only handshake messages are allowed
             // before authentication, so an unauthenticated peer can neither
             // inject input nor read system/app information.
-            let openTypes: Set<String> = ["hello", "pair_request", "auth_proof", "bye"]
+            // `bye` is deliberately NOT here: it runs teardown, which releases
+            // input and stops the video stream process-wide, so an unauthenticated
+            // peer could end a legitimate session's drag and kill its stream.
+            let openTypes: Set<String> = ["hello", "pair_request", "auth_proof"]
             if !openTypes.contains(type) && !box.authenticated {
                 // Dropping these silently is what made a half-finished pairing
                 // look like a working connection: the phone reported connected
@@ -538,7 +643,12 @@ final class NetworkManager {
             // User-controlled "Pause Input": drop injection messages while
             // paused, but keep handshake, heartbeat, clipboard, and queries
             // working so the connection stays healthy.
-            if self.inputPaused && Self.inputTypes.contains(type) {
+            // Up-events are exempt: dropping a mouse_up or key_up leaves the
+            // button or modifier latched in the window server, which breaks the
+            // user's PHYSICAL mouse and keyboard until reboot. Unpausing cannot
+            // repair it either, because the phone already sent the up.
+            if self.inputPaused && Self.inputTypes.contains(type)
+                && !Self.releaseTypes.contains(type) {
                 return
             }
             // Live metrics for the dashboard (counted only when executed).
@@ -551,6 +661,16 @@ final class NetworkManager {
             }
             switch type {
             case "hello":
+                // A second hello on an ALREADY AUTHENTICATED connection used to
+                // rewrite its identity to anything it liked, which corrupted the
+                // metrics and Activity attribution and let one connection's
+                // disconnect remove a different device's row from the dashboard.
+                // Re-introducing yourself after authenticating is not a thing a
+                // legitimate client does.
+                if box.authenticated, box.deviceID != nil {
+                    self.sendError("hello after authentication is not allowed", to: connection)
+                    break
+                }
                 if let payload = dict["payload"] as? [String: Any], let deviceID = payload["deviceID"] as? String {
                     box.deviceID = deviceID
                     if let name = payload["deviceName"] as? String, !name.isEmpty {
@@ -594,9 +714,20 @@ final class NetworkManager {
                        let proof = Data(base64Encoded: proofB64),
                        let qr = self.activeQRSecret, Date() < qr.expires {
                         let expected = self.security.computeHMAC(secret: qr.secret, data: Data(deviceID.utf8))
-                        if expected == proof {
+                        if Self.constantTimeEquals(expected, proof) {
                             let derived = self.security.deriveQRPairSecret(qrSecret: qr.secret, deviceID: deviceID)
-                            try? self.security.storeSharedSecret(derived, for: deviceID)
+                            // A Keychain failure must DENY. Storing nothing while
+                            // authenticating and reporting success left the phone
+                            // believing it was paired and this Mac with no secret,
+                            // so the next connection was an unknown device again.
+                            do {
+                                try self.security.storeSharedSecret(derived, for: deviceID)
+                            } catch {
+                                self.sendError("Could not save the pairing: \(error.localizedDescription)", to: connection)
+                                self.emitActivity("xmark.seal", "QR pairing failed to save — not paired")
+                                connection.cancel()
+                                break
+                            }
                             self.activeQRSecret = nil  // one-time use
                             box.authenticated = true
                             self.sendLine(connection, jsonObject: ["type": "pair_qr_ok", "payload": [:]])
@@ -667,7 +798,7 @@ final class NetworkManager {
                     break
                 }
                 let expected = self.security.computeHMAC(secret: secret, data: nonce)
-                if expected == proof {
+                if Self.constantTimeEquals(expected, proof) {
                     box.authenticated = true
                     box.authNonce = nil
                     self.onDeviceConnected(deviceID)
@@ -728,7 +859,9 @@ final class NetworkManager {
                 // A key with explicit modifiers (keyboard accessory bar shortcuts).
                 if let payload = dict["payload"] as? [String: Any] {
                     let keyCode = (payload["keyCode"] as? Int) ?? Int(payload["keyCode"] as? Double ?? -1)
-                    if keyCode >= 0 {
+                    // Upper bound matters as much as the lower one: CGKeyCode is
+                    // UInt16 and the conversion traps, so 99999 killed the host.
+                    if keyCode >= 0 && keyCode <= 127 {
                         try? self.eventInjector.pressKeyCombo(
                             CGKeyCode(keyCode),
                             command: payload["command"] as? Bool ?? false,
@@ -760,11 +893,13 @@ final class NetworkManager {
                     } else if let dxI = payload["dx"] as? Int, let dyI = payload["dy"] as? Int {
                         dxVal = Double(dxI); dyVal = Double(dyI)
                     }
-                    if let dx = dxVal, let dy = dyVal {
-                        var totalX = box.scrollAccumX + dx
-                        var totalY = box.scrollAccumY + dy
-                        let intX = Int32(totalX.rounded(.towardZero))
-                        let intY = Int32(totalY.rounded(.towardZero))
+                    if let dx = dxVal, let dy = dyVal, dx.isFinite, dy.isFinite {
+                        // Accumulators must stay finite too — a single huge delta
+                        // would otherwise poison them for the whole connection.
+                        var totalX = (box.scrollAccumX + dx).clampedToScrollRange
+                        var totalY = (box.scrollAccumY + dy).clampedToScrollRange
+                        let intX = EventInjector.clampToInt32(totalX.rounded(.towardZero))
+                        let intY = EventInjector.clampToInt32(totalY.rounded(.towardZero))
                         totalX -= Double(intX)
                         totalY -= Double(intY)
                         box.scrollAccumX = totalX
@@ -775,16 +910,14 @@ final class NetworkManager {
                     }
                 }
             case "key_down":
-                if let payload = dict["payload"] as? [String: Any], let keyCode = payload["keyCode"] as? UInt64 {
-                    try? self.eventInjector.keyDown(keyCode: CGKeyCode(keyCode))
-                } else if let payload = dict["payload"] as? [String: Any], let keyCodeInt = payload["keyCode"] as? Int {
-                    try? self.eventInjector.keyDown(keyCode: CGKeyCode(keyCodeInt))
+                if let payload = dict["payload"] as? [String: Any],
+                   let code = Self.virtualKey(from: payload["keyCode"]) {
+                    try? self.eventInjector.keyDown(keyCode: code)
                 }
             case "key_up":
-                if let payload = dict["payload"] as? [String: Any], let keyCode = payload["keyCode"] as? UInt64 {
-                    try? self.eventInjector.keyUp(keyCode: CGKeyCode(keyCode))
-                } else if let payload = dict["payload"] as? [String: Any], let keyCodeInt = payload["keyCode"] as? Int {
-                    try? self.eventInjector.keyUp(keyCode: CGKeyCode(keyCodeInt))
+                if let payload = dict["payload"] as? [String: Any],
+                   let code = Self.virtualKey(from: payload["keyCode"]) {
+                    try? self.eventInjector.keyUp(keyCode: code)
                 }
             case "swipe":
                 if let payload = dict["payload"] as? [String: Any] {
@@ -845,11 +978,26 @@ final class NetworkManager {
                 #endif
             case "now_playing_get":
                 // Current track (Music/Spotify) + system volume for the phone's
-                // media screen. NSAppleScript must run on the main thread.
+                // media screen. NSAppleScript must run on the main thread, and
+                // fetchNowPlaying runs up to four scripts against Music and
+                // Spotify — so a client polling this (the phone's media screen
+                // polls every 3s) blocks the UI thread each time, and a busy
+                // music app or an Automation prompt blocks it for much longer.
+                //
+                // Cache briefly so the cost is bounded no matter how fast a
+                // client asks. Moving NSAppleScript off the main thread would be
+                // the real fix, but it risks a working feature that cannot be
+                // verified from here; tracked for 1.1.
+                if let cached = self.cachedNowPlaying,
+                   CACurrentMediaTime() - cached.at < 1.0 {
+                    self.sendLine(connection, jsonObject: ["type": "now_playing", "payload": cached.payload])
+                    break
+                }
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     let payload = self.fetchNowPlaying()
                     self.queue.async {
+                        self.cachedNowPlaying = (payload, CACurrentMediaTime())
                         self.sendLine(connection, jsonObject: ["type": "now_playing", "payload": payload])
                     }
                 }
@@ -1085,10 +1233,14 @@ final class NetworkManager {
                 guard let payload = dict["payload"] as? [String: Any], let bundleID = payload["bundleIdentifier"] as? String else {
                     self.sendError("request_app_icon missing payload.bundleIdentifier", to: connection); break
                 }
+                // Clamped: unclamped, a client could ask for a 100000x100000
+                // image and make the host allocate gigabytes.
                 let maxSize: Int = {
-                    if let v = payload["maxSize"] as? Int { return v }
-                    if let v = payload["maxSize"] as? Double { return Int(v) }
-                    return 256
+                    let requested: Int
+                    if let v = payload["maxSize"] as? Int { requested = v }
+                    else if let v = payload["maxSize"] as? Double, v.isFinite { requested = Int(v) }
+                    else { requested = 256 }
+                    return min(max(requested, 16), 512)
                 }()
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                     guard let self else { return }
@@ -1100,14 +1252,27 @@ final class NetworkManager {
                         image = ws.icon(forFile: appURL.path)
                     }
                     guard let nsImage = image else { self.sendError("Icon not found for \(bundleID)", to: connection); return }
-                    let targetSize = NSSize(width: maxSize, height: maxSize)
-                    let resized = NSImage(size: targetSize)
-                    resized.lockFocus()
-                    NSGraphicsContext.current?.imageInterpolation = .high
-                    let rect = NSRect(origin: .zero, size: targetSize)
-                    nsImage.draw(in: rect, from: .zero, operation: .copy, fraction: 1.0, respectFlipped: true, hints: nil)
-                    resized.unlockFocus()
-                    guard let tiff = resized.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff), let pngData = rep.representation(using: .png, properties: [:]) else {
+                    // CGContext, not NSImage.lockFocus(): lockFocus and the
+                    // NSGraphicsContext current-context stack are main-thread-only
+                    // AppKit, and this runs on a global queue. Off-main use is
+                    // undefined — in practice blank or corrupted icons, and it can
+                    // crash. jpegData already takes this approach.
+                    var rect = CGRect(x: 0, y: 0, width: maxSize, height: maxSize)
+                    guard let cgSource = nsImage.cgImage(forProposedRect: &rect, context: nil, hints: nil),
+                          let colorSpace = cgSource.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB),
+                          let context = CGContext(data: nil, width: maxSize, height: maxSize,
+                                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                                  space: colorSpace,
+                                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+                        self.sendError("Failed to render icon for \(bundleID)", to: connection); return
+                    }
+                    context.interpolationQuality = .high
+                    context.draw(cgSource, in: CGRect(x: 0, y: 0, width: maxSize, height: maxSize))
+                    guard let scaled = context.makeImage() else {
+                        self.sendError("Failed to render icon for \(bundleID)", to: connection); return
+                    }
+                    let rep = NSBitmapImageRep(cgImage: scaled)
+                    guard let pngData = rep.representation(using: .png, properties: [:]) else {
                         self.sendError("Failed to encode icon for \(bundleID)", to: connection); return
                     }
                     let b64 = pngData.base64EncodedString()
@@ -1427,11 +1592,11 @@ final class NetworkManager {
                         if let v = payload["maxWidth"] as? Double { return Int(v) }
                         return 320
                     }()
-                    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    Task { [weak self] in
                         guard let self else { return }
                         let responseType = "window_thumbnail"
                         var b64: String? = nil
-                        if let n = Int(windowIDStr), let image = self._windowImage(windowNumber: n) {
+                        if let n = Int(windowIDStr), let image = await self._windowImage(windowNumber: n) {
                             if let data = self.jpegData(from: image, maxWidth: maxWidth, quality: 0.8) {
                                 b64 = data.base64EncodedString()
                             }
@@ -1527,13 +1692,18 @@ final class NetworkManager {
         focusTimer.schedule(deadline: .now() + 1, repeating: .seconds(1), leeway: .milliseconds(200))
         focusTimer.setEventHandler { [weak self, weak connection] in
             guard let self, let connection else { return }
-            let focused = Self.focusedElementIsTextInput()
-            if focused != self.lastTextFocusState {
-                self.lastTextFocusState = focused
-                self.sendLine(connection, jsonObject: [
-                    "type": "text_focus",
-                    "payload": ["focused": focused]
-                ])
+            Self.axQueue.async { [weak self, weak connection] in
+                let focused = Self.focusedElementIsTextInput()
+                guard let self, let connection else { return }
+                // lastTextFocusState is queue-confined; hop back to compare it.
+                self.queue.async {
+                    guard focused != self.lastTextFocusState else { return }
+                    self.lastTextFocusState = focused
+                    self.sendLine(connection, jsonObject: [
+                        "type": "text_focus",
+                        "payload": ["focused": focused]
+                    ])
+                }
             }
         }
         focusTimer.resume()
@@ -1824,9 +1994,10 @@ private extension NetworkManager {
     /// on a text field and notifies the phone on CHANGES so it can raise or
     /// lower its keyboard automatically.
     func checkTextFieldFocus(after delay: TimeInterval, connection: NWConnection) {
-        queue.asyncAfter(deadline: .now() + delay) { [weak self, weak connection] in
+        Self.axQueue.asyncAfter(deadline: .now() + delay) { [weak self, weak connection] in
             guard let self, let connection else { return }
             let info = Self.focusedTextInputInfo()
+            self.queue.async {
             self.lastTextFocusState = info.focused
             // Click-driven checks send UNCONDITIONALLY: change-gating here
             // proved fragile (a stale "already focused" suppressed the event
@@ -1841,8 +2012,18 @@ private extension NetworkManager {
                 self.lastFocusDetail = detail
                 self.emitActivity("keyboard", detail)
             }
+            }
         }
     }
+
+    /// Accessibility queries run here, never on `queue`.
+    ///
+    /// AXUIElementCopyAttributeValue against an unresponsive application blocks
+    /// until the AX timeout, and focusedTextInputInfo makes up to five such
+    /// calls. Two are scheduled on every left click. Running them on the network
+    /// serial queue stalled everything it owns for the duration: no input
+    /// injected, no packets read, no teardown, no reaper.
+    private static let axQueue = DispatchQueue(label: "Wield Host.accessibility", qos: .userInitiated)
 
     private static func focusedElementIsTextInput() -> Bool {
         focusedTextInputInfo().focused
@@ -1851,6 +2032,9 @@ private extension NetworkManager {
     /// Focus detection with a diagnostic string (for the Activity log — the
     /// only way to see WHY auto-keyboard didn't fire on a given click).
     static func focusedTextInputInfo() -> (focused: Bool, detail: String) {
+        // Bound how long an unresponsive app can stall us. The default is around
+        // six seconds PER CALL and this function makes several.
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 1.0)
         // The system-wide focused element is flaky for some apps; fall back to
         // asking the frontmost application directly.
         var element: AXUIElement?
@@ -1868,7 +2052,26 @@ private extension NetworkManager {
             }
         }
         guard let element else { return (false, "no focused element readable") }
-        return (elementIsTextInput(element), roleDescription(of: element))
+        if elementIsTextInput(element) { return (true, roleDescription(of: element)) }
+
+        // The system-wide query often SUCCEEDS while returning something useless
+        // -- a window, typically, which is what the Activity log showed as
+        // "AXWindow/AXStandardWindow" while the auto keyboard refused to rise.
+        // Gating the per-app query on the system-wide one *failing* meant the
+        // better answer was never asked for. Ask now, and take it if it is
+        // better; a real text field beats a window every time.
+        if let app = NSWorkspace.shared.frontmostApplication {
+            let appElement = AXUIElementCreateApplication(app.processIdentifier)
+            var appFocusedRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &appFocusedRef) == .success,
+               let raw = appFocusedRef, CFGetTypeID(raw) == AXUIElementGetTypeID() {
+                let appFocused = unsafeDowncast(raw as AnyObject, to: AXUIElement.self)
+                if elementIsTextInput(appFocused) {
+                    return (true, roleDescription(of: appFocused) + " via app")
+                }
+            }
+        }
+        return (false, roleDescription(of: element))
     }
 
     private static func roleDescription(of element: AXUIElement) -> String {
@@ -2425,32 +2628,16 @@ private extension NetworkManager {
         ctx.strokePath()
     }
 
-    func _windowImage(windowNumber: Int) -> CGImage? {
-        // Resolve window bounds first
+    /// Async, deliberately. The previous version started `Task { helper.start() }`
+    /// and then blocked its own thread on a DispatchSemaphore waiting for that
+    /// Task — the exact pattern documented above `_captureDisplayOnceAsync` as
+    /// having starved the Swift concurrency pool and hung the app.
+    /// `_captureDisplayOnce` was converted for that reason; this one was left
+    /// behind, so a client asking for several window thumbnails at once could
+    /// still reproduce the original hang.
+    func _windowImage(windowNumber: Int) async -> CGImage? {
         guard let bounds = _windowBounds(windowNumber: windowNumber) else { return nil }
-
-        // Capture a single screen frame using ScreenCaptureKit
-        final class OneShotConsumer: ScreenFrameConsumer {
-            let sema: DispatchSemaphore
-            var image: CGImage?
-            init(sema: DispatchSemaphore) { self.sema = sema }
-            func didProduceFrame(_ image: CGImage) {
-                if self.image == nil { self.image = image; sema.signal() }
-            }
-        }
-
-        let sema = DispatchSemaphore(value: 0)
-        let helper = ScreenCaptureHelper()
-        let consumer = OneShotConsumer(sema: sema)
-        helper.consumer = consumer
-
-        // Start capture asynchronously and wait for first frame (with timeout)
-        Task {
-            do { try await helper.start() } catch { sema.signal() }
-        }
-        let waitResult = sema.wait(timeout: .now() + 2.5)  // cold SCK start takes 1-3s
-        helper.stop()
-        guard waitResult == .success, let frame = consumer.image else { return nil }
+        guard let frame = await _captureDisplayOnceAsync() else { return nil }
 
         // Compute crop rect in pixels (convert from points using backing scale factor)
         let scale = NSScreen.main?.backingScaleFactor ?? 2.0

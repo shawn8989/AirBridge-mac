@@ -178,11 +178,27 @@ final class AppState: ObservableObject {
         // keyboard/mouse misbehave until reboot. Always release on exit.
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
                                                object: nil, queue: .main) { [weak self] _ in
-            self?.networkManager.emergencyReleaseInput()
-            // Give the async release a beat to post before the process dies.
-            Thread.sleep(forTimeInterval: 0.15)
+            self?.networkManager.emergencyReleaseInputSynchronously()
         }
+
+        // willTerminate is NOT delivered on force-quit, on logout-kill, or when
+        // launchd stops us -- which is exactly when input is most likely to be
+        // latched, because those are the ways you kill an app that is
+        // misbehaving. A signal handler covers what the notification cannot.
+        // Explicitly typed: `networkManager` is declared NetworkManager!, so
+        // binding it without an annotation gives an Optional.
+        let manager: NetworkManager = networkManager
+        Self.terminationSignalSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        Self.terminationSignalSource?.setEventHandler {
+            manager.emergencyReleaseInputSynchronously()
+            exit(0)
+        }
+        Self.terminationSignalSource?.resume()
+        signal(SIGTERM, SIG_IGN)   // the DispatchSource handles it instead
     }
+
+    /// Held for the process lifetime; a released source stops delivering.
+    private static var terminationSignalSource: DispatchSourceSignal?
 
     private var updateCancellable: AnyCancellable?
 
@@ -419,10 +435,36 @@ final class AppState: ObservableObject {
             }
             let decision = PairDecision()
             decision.add(continuation)
-            pendingPairRequest = PairRequest(deviceID: deviceID,
-                                             proposedSecret: proposedSecret,
-                                             decision: decision)
+            let request = PairRequest(deviceID: deviceID,
+                                      proposedSecret: proposedSecret,
+                                      decision: decision)
+            pendingPairRequest = request
+
+            // A prompt nobody answers must not leave the phone waiting forever.
+            // From the phone's side an unresolved pairing is indistinguishable
+            // from a frozen app: it connects, then nothing, with no error to
+            // show. Deny after a minute so the connection fails visibly and can
+            // be retried.
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 60 * 1_000_000_000)
+                guard let self, !request.decision.isDecided else { return }
+                self.logActivity("clock.badge.xmark",
+                                 "Pairing request timed out for \(self.displayName(for: deviceID))")
+                await self.handlePairingDecision(allowed: false, request: request)
+            }
         }
+    }
+
+    /// Acts on whatever prompt is actually on screen.
+    ///
+    /// The sheet closure captures a PairRequest by value, so if a second
+    /// request replaced the first while the sheet was up, Allow decided the
+    /// *old* one — which was already resolved, so the guard below dropped it
+    /// and the prompt just sat there doing nothing. Reading the current
+    /// request here means the button can never be wired to a stale one.
+    func decideCurrentPairing(allowed: Bool) async {
+        guard let request = pendingPairRequest else { return }
+        await handlePairingDecision(allowed: allowed, request: request)
     }
 
     func handlePairingDecision(allowed: Bool, request: PairRequest) async {

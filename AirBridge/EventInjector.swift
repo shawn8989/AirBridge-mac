@@ -71,6 +71,9 @@ final class EventInjector {
     }
     private let moveSource = EventInjector.makeNonSuppressingSource()
     private var didAssociateCursor = false
+    /// Every keycode currently held down by us. Confined to the network serial
+    /// queue, which is the only place keyDown/keyUp are called from.
+    private var heldKeyCodes: Set<CGKeyCode> = []
 
     func moveMouse(dx: Double, dy: Double) throws {
         let source = moveSource
@@ -163,20 +166,34 @@ final class EventInjector {
     func scroll(dx: Double, dy: Double) throws {
         // No logging here: high-rate path, printing adds latency.
         // Use pixel-based scrolling for smooth trackpad-like behavior.
-        let pixelsY = Int32(dy)
-        let pixelsX = Int32(dx)
+        // Int32(Double) TRAPS on a non-finite or out-of-range value, and these
+        // come straight from client JSON — one bad packet would kill the host,
+        // which then leaves whatever was held latched in the window server.
+        let pixelsY = Self.clampToInt32(dy)
+        let pixelsX = Self.clampToInt32(dx)
         guard let ev = CGEvent(scrollWheelEvent2Source: moveSource, units: .pixel, wheelCount: 2, wheel1: pixelsY, wheel2: pixelsX, wheel3: 0) else { throw InjectError.eventCreateFailed }
         ev.post(tap: .cghidEventTap)
+    }
+
+    /// Clamps a client-supplied Double to Int32 without trapping.
+    static func clampToInt32(_ value: Double) -> Int32 {
+        guard value.isFinite else { return 0 }
+        return Int32(value.clamped(to: -2_000_000_000...2_000_000_000).rounded(.towardZero))
     }
 
     func keyDown(keyCode: CGKeyCode) throws {
         print("[EventInjector] keyDown keyCode=\(keyCode)")
         guard let ev = CGEvent(keyboardEventSource: moveSource, virtualKey: keyCode, keyDown: true) else { throw InjectError.eventCreateFailed }
+        // Remember it BEFORE posting: if the connection dies between the down
+        // and its up, releaseAllModifiers is the only thing that can lift this
+        // key, and it can only lift what it knows about.
+        heldKeyCodes.insert(keyCode)
         ev.post(tap: .cghidEventTap)
     }
 
     func keyUp(keyCode: CGKeyCode) throws {
         print("[EventInjector] keyUp keyCode=\(keyCode)")
+        heldKeyCodes.remove(keyCode)
         guard let ev = CGEvent(keyboardEventSource: moveSource, virtualKey: keyCode, keyDown: false) else { throw InjectError.eventCreateFailed }
         ev.post(tap: .cghidEventTap)
     }
@@ -186,7 +203,23 @@ final class EventInjector {
     /// (a stuck Ctrl makes every left click behave as a right click).
     func releaseAllModifiers() {
         print("[EventInjector] releaseAllModifiers")
-        let modifierKeyCodes: [CGKeyCode] = [55, 58, 59, 56, 63] // Cmd, Opt, Ctrl, Shift, Fn
+        // Every modifier, both hands. The left-hand-only list missed right-Cmd
+        // (54), right-Shift (60), right-Opt (61), right-Ctrl (62) and caps lock
+        // (57), any of which a client may send and none of which this "safety
+        // net" could previously lift.
+        let modifierKeyCodes: [CGKeyCode] = [55, 54, 58, 61, 59, 62, 56, 60, 57, 63]
+        // Plus every ordinary key we know is still down. key_down accepts any
+        // keycode, so a dropped connection mid-keypress used to leave that key
+        // held — and the window server auto-repeats it into whatever app is
+        // frontmost, forever.
+        let stuckKeys = heldKeyCodes
+        heldKeyCodes.removeAll()
+        for code in stuckKeys where !modifierKeyCodes.contains(code) {
+            if let up = CGEvent(keyboardEventSource: moveSource, virtualKey: code, keyDown: false) {
+                up.flags = []
+                up.post(tap: .cghidEventTap)
+            }
+        }
         for code in modifierKeyCodes {
             if let up = CGEvent(keyboardEventSource: moveSource, virtualKey: code, keyDown: false) {
                 up.flags = []
@@ -487,3 +520,19 @@ extension EventInjector {
     }
 }
 #endif
+
+
+private extension Comparable {
+    func clamped(to limits: ClosedRange<Self>) -> Self {
+        min(max(self, limits.lowerBound), limits.upperBound)
+    }
+}
+
+extension Double {
+    /// Keeps a scroll accumulator finite and inside Int32 range so the
+    /// conversion in the scroll path can never trap.
+    var clampedToScrollRange: Double {
+        guard isFinite else { return 0 }
+        return Swift.min(Swift.max(self, -2_000_000_000), 2_000_000_000)
+    }
+}
