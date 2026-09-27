@@ -776,7 +776,7 @@ final class NetworkManager {
                                     ])
                                     self.onDeviceConnected(pendingDeviceID)
                                 } else {
-                                    self.sendError("Pairing denied for \(pendingDeviceID)", to: connection)
+                                    self.sendPairDenied(pendingDeviceID, to: connection)
                                     connection.cancel()
                                 }
                             }
@@ -1078,7 +1078,7 @@ final class NetworkManager {
                             ])
                             self.onDeviceConnected(pendingDeviceID)
                         } else {
-                            self.sendError("Pairing denied for \(pendingDeviceID)", to: connection)
+                            self.sendPairDenied(pendingDeviceID, to: connection)
                             connection.cancel()
                         }
                     }
@@ -1637,6 +1637,19 @@ final class NetworkManager {
         } catch {
             print("[Wield Host] Failed to encode JSON: \(error)")
         }
+    }
+
+    /// Tell the phone its pairing was refused, then let the caller cancel.
+    ///
+    /// Both messages go out: `pair_denied` is what a phone should act on, and
+    /// the `error` keeps the refusal visible on phones that predate it. Without
+    /// a distinguishable refusal the phone treats the cancelled socket as a
+    /// dropped one, reconnects, and puts the approval dialog back on screen —
+    /// forever.
+    private func sendPairDenied(_ deviceID: String, to connection: NWConnection) {
+        let message = "Pairing denied for \(deviceID)"
+        sendLine(connection, jsonObject: ["type": "pair_denied", "message": message])
+        sendError(message, to: connection)
     }
 
     private func sendError(_ message: String, to connection: NWConnection) {

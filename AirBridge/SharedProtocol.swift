@@ -398,12 +398,15 @@ public enum BridgeFeature {
     public static let wakeOnLAN = "wake_on_lan"
     /// Live screen streaming.
     public static let liveScreen = "live_screen"
+    /// A refused pairing is reported as an explicit `pair_denied` message, not
+    /// only as a generic `error` the phone has to guess at.
+    public static let pairDenied = "pair_denied"
 
     /// Everything the CURRENT build supports. Add a string here when a feature
     /// lands, and check for it on the phone instead of assuming it exists.
     public static let all: [String] = [
         audioDevices, multiDisplaySpaces, desktopPreviews,
-        skipFullscreen, wakeOnLAN, liveScreen
+        skipFullscreen, wakeOnLAN, liveScreen, pairDenied
     ]
 }
 
