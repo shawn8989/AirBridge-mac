@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [main, "claude/**"]
+    branches: [main, "claude/**", "codex/**"]
   pull_request:
     branches: [main]
 
@@ -22,6 +22,18 @@ jobs:
           xcodebuild build \
             -project AirBridge.xcodeproj \
             -scheme AirBridge \
-            -destination 'platform=macOS' \
+            -destination 'generic/platform=macOS' \
+            -configuration Release \
+            -derivedDataPath build/ci \
+            ARCHS='arm64 x86_64' \
+            ONLY_ACTIVE_ARCH=NO \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGN_IDENTITY=""
+
+      - name: Package unsigned app for signing and device verification
+        run: ditto -c -k --keepParent 'build/ci/Build/Products/Release/Wield Host.app' build/Wield-Host-unsigned.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Wield-Host-unsigned
+          path: build/Wield-Host-unsigned.zip

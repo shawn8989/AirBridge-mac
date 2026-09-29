@@ -2237,10 +2237,14 @@ private extension NetworkManager {
             payload["muted"] = muted.booleanValue
         }
 
-        for app in ["Music", "Spotify"] {
+        for (app, bundleID) in [("Music", "com.apple.Music"), ("Spotify", "com.spotify.client")] {
+            // AppleScript resolves application names while compiling, even inside
+            // an `is running` check. A missing Spotify install opened a hidden
+            // chooser and stalled media polling on the main thread.
+            guard !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty else { continue }
             let script = """
-            if application "\(app)" is running then
-                tell application "\(app)"
+            if application id "\(bundleID)" is running then
+                tell application id "\(bundleID)"
                     if player state is playing then
                         return (name of current track) & "\u{0001}" & (artist of current track)
                     end if

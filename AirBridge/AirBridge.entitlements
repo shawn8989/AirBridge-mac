@@ -2,32 +2,26 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Required capabilities -->
-    <key>com.apple.security.network.server</key>
-    <true/>
-    <key>com.apple.security.personal-information.keychain</key>
-    <true/>
+    <!-- Preserve the capabilities already present in the signed 1.0.1 host. -->
+    <key>com.apple.security.app-sandbox</key><true/>
+    <key>com.apple.security.network.client</key><true/>
+    <key>com.apple.security.network.server</key><true/>
+    <key>com.apple.security.device.audio-input</key><true/>
+    <key>com.apple.security.device.bluetooth</key><true/>
+    <key>com.apple.security.files.user-selected.read-only</key><true/>
 
-    <!-- Accessibility temporary exception (only used if sandboxed and required for CGEvent workflows) -->
-    <key>com.apple.security.temporary-exception.mach-lookup.global-name</key>
-    <array>
-        <string>com.apple.axserver</string>
-    </array>
-
-    <!-- Explicit denials -->
-    <key>com.apple.security.files.user-selected.read-only</key>
-    <false/>
-    <key>com.apple.security.files.user-selected.read-write</key>
-    <false/>
-    <key>com.apple.security.files.downloads.read-write</key>
-    <false/>
-    <key>com.apple.security.files.all</key>
-    <false/>
-    <key>com.apple.security.device.camera</key>
-    <false/>
-    <key>com.apple.security.device.microphone</key>
-    <false/>
-    <key>com.apple.security.automation.apple-events</key>
-    <false/>
+    <!-- Both hardened runtime and App Sandbox need to allow Now Playing queries.
+         macOS still asks the user to allow automation of each music player. -->
+    <key>com.apple.security.automation.apple-events</key><true/>
+    <key>com.apple.security.scripting-targets</key>
+    <dict>
+        <key>com.apple.Music</key>
+        <array>
+            <string>com.apple.Music.playback</string>
+            <string>com.apple.Music.library.read</string>
+        </array>
+    </dict>
+    <key>com.apple.security.temporary-exception.apple-events</key>
+    <array><string>com.spotify.client</string></array>
 </dict>
 </plist>
