@@ -157,6 +157,8 @@ final class NetworkManager {
     // absent, including while macOS is still displaying its permission sheet.
     private var screenCaptureStarting = false
     private var screenCapturePermissionDenied = false
+    private var screenCaptureStartupTimeout: DispatchWorkItem?
+    private var screenCaptureStartupTimedOut = false
     /// Written on the ScreenCapture queue by didProduceFrame, read on `queue`
     /// by the video timer and the one-shot capture path. Locked for the same
     /// reason as ScreenCaptureHelper.lastFrame.
@@ -1670,6 +1672,10 @@ final class NetworkManager {
         // replacing it on every phone watchdog retry. A preflight result alone
         // is not a capture failure; report permission errors only when SCK does.
         if screenCaptureStarting { return }
+        if screenCaptureStartupTimedOut {
+            sendError("Screen capture startup timed out. Close and reopen Live Screen after responding to any permission prompt on the Mac.", to: connection)
+            return
+        }
         if screenCapturePermissionDenied && !CGPreflightScreenCaptureAccess() {
             sendLine(connection, jsonObject: [
                 "type": "stream_error",
@@ -1689,11 +1695,24 @@ final class NetworkManager {
             helper.consumer = self
             self.screenCapture = helper
             self.screenCaptureStarting = true
+            // Do not wait forever on SCK, or restart a permission sheet every
+            // time the phone retries. After a timeout, leaving Live Screen is
+            // the explicit reset; stop() also cancels any late startup.
+            let timeout = DispatchWorkItem { [weak self] in
+                guard let self, self.screenCapture === helper, self.screenCaptureStarting else { return }
+                self.stopVideoStream()
+                self.screenCaptureStartupTimedOut = true
+                self.sendError("Screen capture startup timed out. Close and reopen Live Screen after responding to any permission prompt on the Mac.", to: connection)
+            }
+            self.screenCaptureStartupTimeout = timeout
+            self.queue.asyncAfter(deadline: .now() + 30, execute: timeout)
             Task { [weak self] in
                 do {
                     try await helper.start()
                     self?.queue.async { [weak self] in
                         guard let self, self.screenCapture === helper else { return }
+                        self.screenCaptureStartupTimeout?.cancel()
+                        self.screenCaptureStartupTimeout = nil
                         self.screenCaptureStarting = false
                         self.screenCapturePermissionDenied = false
                     }
@@ -1775,6 +1794,9 @@ final class NetworkManager {
         focusPollTimer = nil
         isSendingFrame = false
         #if os(macOS)
+        screenCaptureStartupTimeout?.cancel()
+        screenCaptureStartupTimeout = nil
+        screenCaptureStartupTimedOut = false
         screenCaptureStarting = false
         screenCapture?.stop()
         screenCapture = nil

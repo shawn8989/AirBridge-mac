@@ -20,6 +20,10 @@ Real-device checks (not covered by the compile-only CI job):
    after leaving, and the new connection should receive frames.
 5. Verify desktop previews still load and closing the phone's Live Screen
    releases the live capture. Verify physical Mac input remains normal.
+6. Leave authorization/startup pending beyond thirty seconds. Capture should
+   time out without blocking Host, and automatic phone retries should not start
+   more permission requests. Respond on the Mac, then leave and reopen Live
+   Screen to retry; relaunch Host if macOS requires it after granting access.
 
 For the reported Mac mini failure, also verify the actual running executable
 path and signing identity match the application approved in System Settings.
