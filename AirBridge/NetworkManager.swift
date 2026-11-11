@@ -49,6 +49,8 @@ private protocol ScreenFrameConsumer: AnyObject {
 
 private final class ScreenCaptureHelper: NSObject, SCStreamOutput, SCStreamDelegate {
     private var stream: SCStream?
+    private let lifecycleLock = NSLock()
+    private var stopped = false
     private var sampleBufferDisplayLayer = AVSampleBufferDisplayLayer()
     private let queue = DispatchQueue(label: "Wield Host.ScreenCapture")
     weak var consumer: ScreenFrameConsumer?
@@ -63,7 +65,9 @@ private final class ScreenCaptureHelper: NSObject, SCStreamOutput, SCStreamDeleg
     }
 
     func start() async throws {
+        try checkActive()
         let content = try await SCShareableContent.current
+        try checkActive()
         guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) ?? content.displays.first else {
             throw NSError(domain: "Wield Host", code: -2, userInfo: [NSLocalizedDescriptionKey: "No display available for capture"]) }
         let filter = SCContentFilter(display: display, excludingWindows: [])
@@ -78,14 +82,37 @@ private final class ScreenCaptureHelper: NSObject, SCStreamOutput, SCStreamDeleg
         config.height = display.height
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
-        self.stream = stream
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+        try install(stream)
         try await stream.startCapture()
+        // stop() can run while either async startup operation is suspended.
+        // A late completion must not resurrect a stream after the phone left.
+        do { try checkActive() } catch {
+            try? await stream.stopCapture()
+            throw error
+        }
+    }
+
+    private func checkActive() throws {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        if stopped { throw CancellationError() }
+    }
+
+    private func install(_ stream: SCStream) throws {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        if stopped { throw CancellationError() }
+        self.stream = stream
     }
 
     func stop() {
+        lifecycleLock.lock()
+        stopped = true
+        let stream = self.stream
+        self.stream = nil
+        lifecycleLock.unlock()
         stream?.stopCapture(completionHandler: { _ in })
-        stream = nil
         lastFrame = nil
     }
 
@@ -126,6 +153,10 @@ final class NetworkManager {
     private var isSendingFrame = false
     #if os(macOS)
     private var screenCapture: ScreenCaptureHelper?
+    // Queue-confined. The phone retries every two seconds while frames are
+    // absent, including while macOS is still displaying its permission sheet.
+    private var screenCaptureStarting = false
+    private var screenCapturePermissionDenied = false
     /// Written on the ScreenCapture queue by didProduceFrame, read on `queue`
     /// by the video timer and the one-shot capture path. Locked for the same
     /// reason as ScreenCaptureHelper.lastFrame.
@@ -1089,17 +1120,6 @@ final class NetworkManager {
                     else if let maxWD = payload["maxWidth"] as? Double { self.videoMaxWidth = Int(maxWD) }
                     if let q = payload["quality"] as? Double { self.videoQuality = max(0.1, min(1.0, q)) }
                 }
-                #if os(macOS)
-                // Without Screen Recording permission, capture fails silently and
-                // the phone shows "no frames" forever. Tell it why.
-                if !CGPreflightScreenCaptureAccess() {
-                    _ = CGRequestScreenCaptureAccess()  // prompts / adds AirBridge to the list once
-                    self.sendLine(connection, jsonObject: [
-                        "type": "stream_error",
-                        "payload": ["reason": "screen_recording_permission"]
-                    ])
-                }
-                #endif
                 self.startVideoStream(to: connection)
             case "video_stop":
                 self.stopVideoStream()
@@ -1645,6 +1665,19 @@ final class NetworkManager {
     }
 
     private func startVideoStream(to connection: NWConnection) {
+        #if os(macOS)
+        // Let ScreenCaptureKit finish its own authorization/startup instead of
+        // replacing it on every phone watchdog retry. A preflight result alone
+        // is not a capture failure; report permission errors only when SCK does.
+        if screenCaptureStarting { return }
+        if screenCapturePermissionDenied && !CGPreflightScreenCaptureAccess() {
+            sendLine(connection, jsonObject: [
+                "type": "stream_error",
+                "payload": ["reason": "screen_recording_permission"]
+            ])
+            return
+        }
+        #endif
         stopVideoStream()
         // Re-announce keyboard focus from scratch on every new stream: a stale
         // "already focused" state otherwise suppresses the text_focus event the
@@ -1655,9 +1688,34 @@ final class NetworkManager {
             let helper = ScreenCaptureHelper()
             helper.consumer = self
             self.screenCapture = helper
+            self.screenCaptureStarting = true
             Task { [weak self] in
-                do { try await helper.start() } catch {
-                    self?.sendError("Screen capture start failed: \(error.localizedDescription)", to: connection)
+                do {
+                    try await helper.start()
+                    self?.queue.async { [weak self] in
+                        guard let self, self.screenCapture === helper else { return }
+                        self.screenCaptureStarting = false
+                        self.screenCapturePermissionDenied = false
+                    }
+                } catch {
+                    let failure = error as NSError
+                    self?.queue.async { [weak self] in
+                        guard let self, self.screenCapture === helper else { return }
+                        self.stopVideoStream()
+                        if failure.domain == SCStreamErrorDomain &&
+                            failure.code == SCStreamError.Code.userDeclined.rawValue {
+                            // Do not reopen macOS authorization on every retry.
+                            // Settings or a relaunch can make access available.
+                            self.screenCapturePermissionDenied = true
+                            self.sendLine(connection, jsonObject: [
+                                "type": "stream_error",
+                                "payload": ["reason": "screen_recording_permission"]
+                            ])
+                        } else {
+                            self.sendError("Screen capture start failed: \(failure.localizedDescription)", to: connection)
+                        }
+                        print("[Wield Host] Capture start: \(failure.domain) \(failure.code); preflight=\(CGPreflightScreenCaptureAccess()); app=\(Bundle.main.bundlePath)")
+                    }
                 }
             }
         }
@@ -1717,6 +1775,7 @@ final class NetworkManager {
         focusPollTimer = nil
         isSendingFrame = false
         #if os(macOS)
+        screenCaptureStarting = false
         screenCapture?.stop()
         screenCapture = nil
         latestCapturedImage = nil

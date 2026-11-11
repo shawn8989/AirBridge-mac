@@ -1,0 +1,26 @@
+Screen Recording retry regression checks
+
+Candidate change: let ScreenCaptureKit report authorization failures, keep one
+startup in flight, and suppress repeated authorization attempts after denial
+until macOS reports access or Host is relaunched. Stopping a capture also
+prevents an outstanding startup from creating an orphan stream.
+
+Real-device checks (not covered by the compile-only CI job):
+
+1. On a Mac without access, open Live Screen and leave the system permission
+   prompt unanswered for at least ten seconds. There should be one startup,
+   without replacement requests from the iPhone watchdog.
+2. Deny the request. The iPhone should show its Screen Recording guidance;
+   waiting, reconnecting, and reopening Live Screen must not reopen the system
+   prompt repeatedly. Host should log the SCK error domain/code and app path.
+3. Enable access for the signed installed Host and quit/reopen it. Reconnect
+   the phone: Live Screen should deliver frames and clear the error banner.
+4. With access already granted, repeatedly enter/leave Live Screen during
+   startup, disconnect the phone, and reconnect. No old capture should start
+   after leaving, and the new connection should receive frames.
+5. Verify desktop previews still load and closing the phone's Live Screen
+   releases the live capture. Verify physical Mac input remains normal.
+
+For the reported Mac mini failure, also verify the actual running executable
+path and signing identity match the application approved in System Settings.
+A successful CI build is not proof that this machine-specific issue is fixed.
