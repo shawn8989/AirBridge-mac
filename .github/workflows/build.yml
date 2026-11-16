@@ -16,6 +16,11 @@ jobs:
       - name: Show Xcode version
         run: xcodebuild -version
 
+      - name: Verify per-device TLS over real loopback sockets
+        run: |
+          swiftc -parse-as-library AirBridge/SecureTransport.swift Tests/SecureTransportChecks.swift -o /tmp/wield-secure-checks
+          /tmp/wield-secure-checks
+
       - name: Build (no signing)
         run: |
           set -o pipefail

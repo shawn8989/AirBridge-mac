@@ -64,6 +64,29 @@ final class SecurityManager {
         SecItemDelete(query as CFDictionary)
     }
 
+
+    func storeSecureSecret(_ secret: Data, for deviceID: String) throws {
+        try storeSharedSecret(secret, for: "secure-v2." + deviceID)
+        var ids = UserDefaults.standard.stringArray(forKey: "secureDeviceIDs.v2") ?? []
+        if !ids.contains(deviceID) { ids.append(deviceID) }
+        UserDefaults.standard.set(ids, forKey: "secureDeviceIDs.v2")
+    }
+    func secureSecret(for deviceID: String) -> Data? {
+        try? loadSharedSecret(for: "secure-v2." + deviceID)
+    }
+    func secureKeys(purpose: String) -> [String: Data] {
+        var result: [String: Data] = [:]
+        for id in UserDefaults.standard.stringArray(forKey: "secureDeviceIDs.v2") ?? [] {
+            if let secret = secureSecret(for: id) { result[id] = WieldSecureTransport.key(secret: secret, purpose: purpose) }
+        }
+        return result
+    }
+    func deleteSecureSecret(for deviceID: String) {
+        deleteSharedSecret(for: "secure-v2." + deviceID)
+        let ids = (UserDefaults.standard.stringArray(forKey: "secureDeviceIDs.v2") ?? []).filter { $0 != deviceID }
+        UserDefaults.standard.set(ids, forKey: "secureDeviceIDs.v2")
+    }
+
     // Compute HMAC-SHA256 over canonical JSON payload bytes
     func computeHMAC(secret: Data, data: Data) -> Data {
         let key = SymmetricKey(data: secret)

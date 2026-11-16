@@ -344,33 +344,7 @@ public enum AirSecureChannel {
         return params
     }
 
-    /// Server side: resolve the PSK per connecting client via its offered identity
-    /// (the client's device ID). Return nil from `keyForIdentity` to reject.
-    ///
-    /// NOTE: the dispatch_data <-> Data bridging in the selection block is the
-    /// part most likely to need an SDK-specific tweak; adjust if the compiler
-    /// reports a different parameter type for `pskIdentity`.
-    public static func makeServerPSKParameters(queue: DispatchQueue,
-                                               keyForIdentity: @escaping (String) -> Data?) -> NWParameters {
-        let tls = NWProtocolTLS.Options()
-        let sec = tls.securityProtocolOptions
-        configurePSKCommon(sec)
-        sec_protocol_options_set_pre_shared_key_selection_block(sec, { _, pskIdentity, complete in
-            guard let pskIdentity else { complete(nil); return }
-            let identityData = Data(pskIdentity as DispatchData)
-            let identity = String(decoding: identityData, as: UTF8.self)
-            if let key = keyForIdentity(identity) {
-                complete(dispatchData(key) as __DispatchData)
-            } else {
-                complete(nil)
-            }
-        }, queue)
-        let tcp = NWProtocolTCP.Options()
-        tcp.noDelay = true   // disable Nagle's algorithm for low-latency real-time input
-        let params = NWParameters(tls: tls, tcp: tcp)
-        params.allowLocalEndpointReuse = true
-        return params
-    }
+
 }
 
 // MARK: - Capability negotiation
@@ -398,12 +372,15 @@ public enum BridgeFeature {
     public static let wakeOnLAN = "wake_on_lan"
     /// Live screen streaming.
     public static let liveScreen = "live_screen"
+    public static let secureRemote = "secure_remote_v2"
+    public static let fileTransfer = "file_transfer_v1"
+    public static let remoteReadiness = "remote_readiness"
 
     /// Everything the CURRENT build supports. Add a string here when a feature
     /// lands, and check for it on the phone instead of assuming it exists.
     public static let all: [String] = [
         audioDevices, multiDisplaySpaces, desktopPreviews,
-        skipFullscreen, wakeOnLAN, liveScreen
+        skipFullscreen, wakeOnLAN, liveScreen, secureRemote, fileTransfer, remoteReadiness
     ]
 }
 
