@@ -18,6 +18,7 @@ final class SecureFileServer {
         var deviceID: String?
         var nonce: Data?
         var authenticated = false
+        var authenticatedSecret: Data?
         var transfer: FileTransferHandle?
         var lastActivity = Date()
         init(_ connection: NWConnection) { self.connection = connection }
@@ -124,9 +125,10 @@ final class SecureFileServer {
                       WieldSecureTransport.verifies(proof, secret: secret, nonce: nonce, context: "file-client:" + macID) else {
                     throw RemoteError.message("Pairing was revoked or changed.")
                 }
-                session.authenticated = true; session.nonce = nil
+                session.authenticated = true; session.authenticatedSecret = secret; session.nonce = nil
             } else {
-                guard session.authenticated, let deviceID = session.deviceID, security.secureSecret(for: deviceID) != nil else {
+                guard session.authenticated, let deviceID = session.deviceID,
+                      let current = security.secureSecret(for: deviceID), current == session.authenticatedSecret else {
                     session.authenticated = false
                     throw RemoteError.message("Pairing required.")
                 }

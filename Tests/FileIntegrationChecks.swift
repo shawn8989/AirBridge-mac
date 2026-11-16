@@ -57,8 +57,14 @@ import Network
             _ = try await rpc.request(["op": "write", "transfer": pending2["transfer"] as! String, "offset": 0, "data": Data([1]).base64EncodedString()])
             fatalError("Revoked folder accepted a write")
         } catch {}
+        // Rotation must invalidate an already-authenticated connection too.
+        try security.storeSecureSecret(security.generateSharedSecret(), for: device)
+        do { _ = try await rpc.request(["op": "roots"]); fatalError("Replaced key retained access") } catch {}
+        try security.storeSecureSecret(secret, for: device)
+        let revoked = FileRPC(config); defer { revoked.close() }
+        try await revoked.authenticate(config)
         security.deleteSecureSecret(for: device)
-        do { _ = try await rpc.request(["op": "roots"]); fatalError("Revoked pairing retained access") } catch {}
+        do { _ = try await revoked.request(["op": "roots"]); fatalError("Revoked pairing retained access") } catch {}
         let files = try fm.contentsOfDirectory(atPath: base.path)
         precondition(!files.contains(where: { $0.hasPrefix(".wield-upload-") }))
         print("Real encrypted client/server: authentication, download, upload, collision, traversal, cancellation, folder and device revocation passed")

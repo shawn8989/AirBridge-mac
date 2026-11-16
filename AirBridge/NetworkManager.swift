@@ -748,11 +748,8 @@ final class NetworkManager {
                 }
                 return
             }
-            if box.secureTransport && box.authenticated,
-               let id = box.deviceID, security.secureSecret(for: id) == nil {
-                teardown(connection, reason: "secure pairing revoked")
-                return
-            }
+            // Revocation/QR replacement tears down matching sessions on this
+            // queue. Do not read Keychain on every high-rate pointer packet.
             // Explicit goodbye from the phone's Disconnect button: tear down
             // NOW instead of waiting for the socket to die on its own.
             if type == "bye" {
@@ -848,6 +845,13 @@ final class NetworkManager {
                                 connection.cancel()
                                 break
                             }
+                            // Re-pairing rotates this phone's credential. Older
+                            // sessions must not survive using the replaced key.
+                            let stale = self.activeConnections.filter {
+                                $0.key != ObjectIdentifier(connection) && self.connectionBoxes[$0.key]?.deviceID == deviceID
+                            }.map(\.value)
+                            for previous in stale { self.teardown(previous, reason: "pairing replaced") }
+                            self.files.revoke(deviceID)
                             self.activeQRSecret = nil  // one-time use
                             self.refreshSecureListeners()
                             box.authenticated = true
