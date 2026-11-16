@@ -34,6 +34,7 @@ private final class ConnectionBox {
     // connection has proven knowledge of the device's shared secret.
     var authenticated = false
     var secureTransport = false
+    var frameAcknowledgements = false
     var authNonce: Data?
     /// Set after telling the peer once that it is not authorized, so an input
     /// stream arriving at ~120/s cannot turn into 120 error messages a second.
@@ -157,6 +158,13 @@ final class NetworkManager {
     private var videoMaxWidth: Int = 800
     private var videoQuality: Double = 0.6
     private var isSendingFrame = false
+    private var videoGeneration = UUID()
+    private var videoSequence = 0
+    private var videoSentAt = Date.distantPast
+    private var videoRoundTrip = 0.1
+    private var videoAutoQuality = true
+    private var videoConnectionID: ObjectIdentifier?
+
     #if os(macOS)
     private var screenCapture: ScreenCaptureHelper?
     // Queue-confined. The phone retries every two seconds while frames are
@@ -777,6 +785,7 @@ final class NetworkManager {
                 }
                 if let payload = dict["payload"] as? [String: Any], let deviceID = payload["deviceID"] as? String {
                     box.deviceID = deviceID
+                    box.frameAcknowledgements = payload["frameAck"] as? Bool ?? false
                     if let name = payload["deviceName"] as? String, !name.isEmpty {
                         let handler = self.onDeviceNamed
                         DispatchQueue.main.async { handler?(deviceID, name) }
@@ -1212,12 +1221,27 @@ final class NetworkManager {
                         }
                     }
                 }
+            case "video_ack":
+                if videoConnectionID == ObjectIdentifier(connection),
+                   let payload = dict["payload"] as? [String: Any],
+                   payload["frame"] as? Int == videoSequence {
+                    let elapsed = Date().timeIntervalSince(videoSentAt)
+                    videoRoundTrip = 0.7 * videoRoundTrip + 0.3 * min(5, elapsed)
+                    isSendingFrame = false
+                }
+            case "video_config":
+                if videoConnectionID == ObjectIdentifier(connection), let payload = dict["payload"] as? [String: Any] {
+                    if let width = payload["maxWidth"] as? Int { videoMaxWidth = max(320, min(2048, width)) }
+                    if let quality = payload["quality"] as? Double { videoQuality = max(0.1, min(1, quality)) }
+                    videoAutoQuality = payload["automatic"] as? Bool ?? true
+                }
             case "video_start":
                 if let payload = dict["payload"] as? [String: Any] {
-                    if let maxW = payload["maxWidth"] as? Int { self.videoMaxWidth = maxW }
-                    else if let maxWD = payload["maxWidth"] as? Double { self.videoMaxWidth = Int(maxWD) }
+                    if let maxW = payload["maxWidth"] as? Int { self.videoMaxWidth = max(320, min(2048, maxW)) }
+                    else if let maxWD = payload["maxWidth"] as? Double { self.videoMaxWidth = max(320, min(2048, Int(maxWD))) }
                     if let q = payload["quality"] as? Double { self.videoQuality = max(0.1, min(1.0, q)) }
                 }
+                if let payload = dict["payload"] as? [String: Any] { self.videoAutoQuality = payload["automatic"] as? Bool ?? true }
                 self.startVideoStream(to: connection)
             case "video_stop":
                 self.stopVideoStream()
@@ -1835,24 +1859,32 @@ final class NetworkManager {
             }
         }
         #endif
+        let generation = UUID()
+        videoGeneration = generation
+        videoConnectionID = ObjectIdentifier(connection)
+        videoRoundTrip = 0.1
+        let acknowledges = connectionBoxes[ObjectIdentifier(connection)]?.frameAcknowledgements ?? false
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now(), repeating: .milliseconds(66), leeway: .milliseconds(10)) // ~15 FPS
+        timer.schedule(deadline: .now(), repeating: .milliseconds(66), leeway: .milliseconds(10))
         timer.setEventHandler { [weak self, weak connection] in
-            guard let self = self, let connection = connection else { return }
-            if self.isSendingFrame { return }
-            self.isSendingFrame = true
+            guard let self, let connection, self.videoGeneration == generation, !self.isSendingFrame else { return }
             #if os(macOS)
-            if let frame = self.latestCapturedImage {
-                if let data = self.jpegData(from: frame, maxWidth: self.videoMaxWidth, quality: self.videoQuality) {
-                    let b64 = data.base64EncodedString()
-                    let obj: [String: Any] = ["type": "video_jpeg", "payload": ["data": b64]]
-                    self.sendLine(connection, jsonObject: obj)
-                }
-            }
-            #else
-            // Fallback (non-macOS platforms)
+            guard let frame = self.latestCapturedImage else { return }
+            let scale: Double = self.videoAutoQuality && acknowledges ? (self.videoRoundTrip > 0.5 ? 0.4 : self.videoRoundTrip > 0.2 ? 0.65 : 1) : 1
+            let width = max(320, Int(Double(self.videoMaxWidth) * scale))
+            let quality = max(0.25, self.videoQuality * scale)
+            guard let jpeg = self.jpegData(from: frame, maxWidth: width, quality: quality) else { return }
+            self.videoSequence &+= 1
+            let object: [String: Any] = ["type": "video_jpeg", "payload": ["data": jpeg.base64EncodedString(), "frame": self.videoSequence, "width": width]]
+            guard var data = try? JSONSerialization.data(withJSONObject: object) else { return }
+            data.append(10)
+            self.isSendingFrame = true
+            self.videoSentAt = Date()
+            connection.send(content: data, completion: .contentProcessed { [weak self] error in
+                guard let self, self.videoGeneration == generation else { return }
+                if error != nil || !acknowledges { self.isSendingFrame = false }
+            })
             #endif
-            self.isSendingFrame = false
         }
         timer.resume()
         self.videoTimer = timer
@@ -1884,6 +1916,8 @@ final class NetworkManager {
     }
 
     private func stopVideoStream() {
+        videoGeneration = UUID()
+        videoConnectionID = nil
         videoTimer?.cancel()
         videoTimer = nil
         focusPollTimer?.cancel()

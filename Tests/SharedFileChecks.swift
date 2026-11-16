@@ -23,8 +23,10 @@ import Foundation
         for offset in stride(from: 0, to: body.count, by: 48 * 1024) {
             try upload.writeChunk(body.subdata(in: offset..<min(offset + 48 * 1024, body.count)))
         }
-        precondition(try upload.commit() == "document (1).txt")
-        precondition(try Data(contentsOf: original) == Data("original".utf8))
+        let savedName = try upload.commit()
+        precondition(savedName == "document (1).txt")
+        let originalData = try Data(contentsOf: original)
+        precondition(originalData == Data("original".utf8))
         let download = try FileTransferHandle(download: "document (1).txt", rootID: "root", root: root)
         var result = Data()
         while download.offset < download.size { result.append(try download.readChunk()) }
@@ -33,10 +35,12 @@ import Foundation
         try partial!.writeChunk(Data([1,2,3]))
         do { let _ = try partial!.commit(); fatalError("Incomplete upload committed") } catch {}
         partial = nil
-        precondition(!(try fm.contentsOfDirectory(atPath: rootURL.path)).contains(where: { $0.hasPrefix(".wield-upload-") }))
+        let remainingFiles = try fm.contentsOfDirectory(atPath: rootURL.path)
+        precondition(!remainingFiles.contains(where: { $0.hasPrefix(".wield-upload-") }))
         let empty = try FileTransferHandle(upload: "empty.txt", size: 0, directory: "", rootID: "root", root: root)
         _ = try empty.commit()
-        precondition(try Data(contentsOf: rootURL.appendingPathComponent("empty.txt")).isEmpty)
+        let emptyData = try Data(contentsOf: rootURL.appendingPathComponent("empty.txt"))
+        precondition(emptyData.isEmpty)
         print("Files: traversal, symlink escape, chunking, collision, atomic completion, cancellation, empty file passed")
     }
 }

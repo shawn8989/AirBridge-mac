@@ -375,12 +375,13 @@ public enum BridgeFeature {
     public static let secureRemote = "secure_remote_v2"
     public static let fileTransfer = "file_transfer_v1"
     public static let remoteReadiness = "remote_readiness"
+    public static let adaptiveVideo = "adaptive_video"
 
     /// Everything the CURRENT build supports. Add a string here when a feature
     /// lands, and check for it on the phone instead of assuming it exists.
     public static let all: [String] = [
         audioDevices, multiDisplaySpaces, desktopPreviews,
-        skipFullscreen, wakeOnLAN, liveScreen, secureRemote, fileTransfer, remoteReadiness
+        skipFullscreen, wakeOnLAN, liveScreen, secureRemote, fileTransfer, remoteReadiness, adaptiveVideo
     ]
 }
 
