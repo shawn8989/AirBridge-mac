@@ -1244,6 +1244,14 @@ final class NetworkManager {
                 }
             case "video_start":
                 if let payload = dict["payload"] as? [String: Any] {
+                    #if os(macOS)
+                    if payload["retry"] as? Bool == true, !screenCaptureStarting {
+                        // An explicit user retry may try capture again even if
+                        // CGPreflight has not caught up with a permission change.
+                        screenCapturePermissionDenied = false
+                        screenCaptureStartupTimedOut = false
+                    }
+                    #endif
                     if let maxW = payload["maxWidth"] as? Int { self.videoMaxWidth = max(320, min(2048, maxW)) }
                     else if let maxWD = payload["maxWidth"] as? Double { self.videoMaxWidth = max(320, min(2048, Int(maxWD))) }
                     if let q = payload["quality"] as? Double { self.videoQuality = max(0.1, min(1.0, q)) }
@@ -1252,6 +1260,9 @@ final class NetworkManager {
                 self.startVideoStream(to: connection)
             case "video_stop":
                 self.stopVideoStream()
+                #if os(macOS)
+                screenCapturePermissionDenied = false
+                #endif
 
             case "request_installed_apps":
                 #if os(macOS)
@@ -1800,7 +1811,7 @@ final class NetworkManager {
         // is not a capture failure; report permission errors only when SCK does.
         if screenCaptureStarting { return }
         if screenCaptureStartupTimedOut {
-            sendError("Screen capture startup timed out. Close and reopen Live Screen after responding to any permission prompt on the Mac.", to: connection)
+            sendLine(connection, jsonObject: ["type": "stream_error", "payload": ["reason": "capture_timeout", "message": "Screen capture timed out. Respond to any prompt on the Mac, then tap Retry."]])
             return
         }
         if screenCapturePermissionDenied && !CGPreflightScreenCaptureAccess() {
@@ -1829,7 +1840,7 @@ final class NetworkManager {
                 guard let self, self.screenCapture === helper, self.screenCaptureStarting else { return }
                 self.stopVideoStream()
                 self.screenCaptureStartupTimedOut = true
-                self.sendError("Screen capture startup timed out. Close and reopen Live Screen after responding to any permission prompt on the Mac.", to: connection)
+                self.sendLine(connection, jsonObject: ["type": "stream_error", "payload": ["reason": "capture_timeout", "message": "Screen capture timed out. Respond to any prompt on the Mac, then tap Retry."]])
             }
             self.screenCaptureStartupTimeout = timeout
             self.queue.asyncAfter(deadline: .now() + 30, execute: timeout)
@@ -1858,7 +1869,7 @@ final class NetworkManager {
                                 "payload": ["reason": "screen_recording_permission"]
                             ])
                         } else {
-                            self.sendError("Screen capture start failed: \(failure.localizedDescription)", to: connection)
+                            self.sendLine(connection, jsonObject: ["type": "stream_error", "payload": ["reason": "capture_failed", "message": "Screen capture could not start: \(failure.localizedDescription)"]])
                         }
                         print("[Wield Host] Capture start: \(failure.domain) \(failure.code); preflight=\(CGPreflightScreenCaptureAccess()); app=\(Bundle.main.bundlePath)")
                     }
