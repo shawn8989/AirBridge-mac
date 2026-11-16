@@ -26,6 +26,11 @@ jobs:
           swiftc -parse-as-library AirBridge/SecureTransport.swift AirBridge/SharedFiles.swift Tests/SharedFileChecks.swift -o /tmp/wield-file-checks
           /tmp/wield-file-checks
 
+      - name: Exercise the actual encrypted file client and server
+        run: |
+          swiftc -parse-as-library AirBridge/SecureTransport.swift AirBridge/SecurityManager.swift AirBridge/SharedProtocol.swift AirBridge/SharedFiles.swift AirBridge/SecureFileServer.swift Tests/FileConnection.swift Tests/FileIntegrationChecks.swift -o /tmp/wield-file-integration
+          /tmp/wield-file-integration
+
       - name: Build (no signing)
         run: |
           set -o pipefail

@@ -411,9 +411,13 @@ final class NetworkManager {
         connectionBoxes.removeValue(forKey: key)
         activeConnections.removeValue(forKey: key)
         print("[Wield Host] Connection closed (\(reason))")
-        eventInjector.releaseAllModifiers()
-        stopVideoStream()
-        onDeviceDisconnected(deviceID)
+        // A failed/unauthenticated handshake must not interrupt somebody
+        // else's screen or release input from an active authenticated session.
+        if box.authenticated {
+            eventInjector.releaseAllModifiers()
+            if videoConnectionID == key { stopVideoStream() }
+            onDeviceDisconnected(deviceID)
+        }
     }
 
     /// Releases every synthetic modifier and mouse button — called when the
