@@ -186,7 +186,7 @@ footer a { color: var(--muted); }
       <a href="#pricing">Pricing</a>
       <a href="#faq">FAQ</a>
       <a href="#support">Support</a>
-      <a class="cta" href="https://github.com/shawn8989/AirBridge-mac/releases/latest">Download</a>
+      <a class="cta" href="https://apps.apple.com/app/id6804338937">Get Wield for iPhone</a>
     </div>
   </div>
 </nav>
@@ -198,9 +198,9 @@ footer a { color: var(--muted); }
      encrypted on your own Wi-Fi. Nothing ever leaves your network.</p>
   <div class="btns">
     <a class="btn btn-light" href="https://github.com/shawn8989/AirBridge-mac/releases/latest">⬇︎&nbsp; Download Wield Host for Mac</a>
-    <a class="btn btn-ghost" href="#pricing">Get Wield on the App&nbsp;Store</a>
+    <a class="btn btn-ghost" href="https://apps.apple.com/app/id6804338937">Get Wield on the App&nbsp;Store</a>
   </div>
-  <p class="version-note" id="version-note">Free · macOS 14 or later</p>
+  <p class="version-note" id="version-note">Free Wield Host · macOS 26.1 or later</p>
 
   <div class="scene" aria-hidden="true">
     <div class="mac">
@@ -269,8 +269,8 @@ footer a { color: var(--muted); }
         <small><strong>Move it before you open it.</strong> macOS runs downloaded apps from a temporary
         location until they are in Applications, and permissions granted there silently don't stick.</small></div></div>
       <div class="step"><div class="n"></div><div><strong>Open Wield Host</strong> from Applications.
-        <small>Grant the Accessibility permission when asked — that's how it moves your cursor.</small></div></div>
-      <div class="step"><div class="n"></div><div><strong>Get Wield</strong> on your iPhone from the App Store.</div></div>
+        <small>Grant Accessibility for input control and Screen Recording for Live Screen and previews.</small></div></div>
+      <div class="step"><div class="n"></div><div><strong><a href="https://apps.apple.com/app/id6804338937">Get Wield</a></strong> on your iPhone from the App Store (iOS 17 or later).</div></div>
       <div class="step"><div class="n"></div><div><strong>Same Wi-Fi, tap your Mac, approve the pairing.</strong>
         <small>Or scan the QR code in Wield Host for instant pairing. Either way, it remembers you.</small></div></div>
     </div>
@@ -318,8 +318,8 @@ footer a { color: var(--muted); }
       </div>
       <div class="price-card featured">
         <h3>Wield Pro</h3>
-        <div class="amount">$7.99</div>
-        <div class="per">one time — no subscription, ever</div>
+        <div class="amount">$9.99 <span style="font-size:.4em">USD</span></div>
+        <div class="per">one time — no subscription<br>US price. Local prices vary by region; see the App Store.</div>
         <ul>
           <li>Air Mouse &amp; Hand Mouse</li>
           <li>Gesture Studio custom gestures</li>
@@ -353,7 +353,7 @@ footer a { color: var(--muted); }
          points to the latest official release, and the app is notarized by Apple, so
          macOS independently verifies it hasn't been tampered with.</p></details>
     <details><summary>What does Wield Host need to work?</summary>
-      <p>macOS 14 or later, and the Accessibility permission (System Settings → Privacy
+      <p>macOS 26.1 or later, and the Accessibility permission (System Settings → Privacy
          &amp; Security → Accessibility) so it can move the cursor and type on your behalf.
          Live Screen additionally uses the Screen Recording permission — Wield Host's
          dashboard walks you through both.</p></details>
@@ -385,6 +385,7 @@ footer a { color: var(--muted); }
     <p class="sub">Wield Host is free. Wield's trial is free. Worst case, you spend one
        minute and get a free trackpad out of it.</p>
     <div class="btns">
+      <a class="btn btn-light" href="https://apps.apple.com/app/id6804338937">Get Wield for iPhone</a>
       <a class="btn btn-dl" href="https://github.com/shawn8989/AirBridge-mac/releases/latest">⬇︎&nbsp; Download Wield Host for Mac</a>
     </div>
   </div>
@@ -459,7 +460,7 @@ fetch("https://api.github.com/repos/shawn8989/AirBridge-mac/releases/latest")
     if (!rel || !rel.tag_name) return;
     const note = document.getElementById("version-note");
     note.textContent = "Latest: Wield Host " + rel.tag_name.replace(/^v/, "") +
-                       " · Free · macOS 14 or later";
+                       " · Free · macOS 26.1 or later";
   })
   .catch(() => {});
 </script>
