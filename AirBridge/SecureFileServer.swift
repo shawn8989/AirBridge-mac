@@ -34,7 +34,10 @@ final class SecureFileServer {
                     on: NWEndpoint.Port(rawValue: WieldSecureTransport.filePort)!)
                 self.listener = listener
                 listener.service = NWListener.Service(name: self.macName, type: WieldSecureTransport.fileServiceType)
-                listener.newConnectionHandler = { [weak self] connection in self?.accept(connection) }
+                listener.newConnectionHandler = { [weak self] connection in
+                    guard let self, self.generation == generation, self.listener != nil else { connection.cancel(); return }
+                    self.accept(connection)
+                }
                 listener.stateUpdateHandler = { [weak self] state in
                     guard let self, self.generation == generation else { return }
                     if case .failed = state {
@@ -124,6 +127,7 @@ final class SecureFileServer {
                 session.authenticated = true; session.nonce = nil
             } else {
                 guard session.authenticated, let deviceID = session.deviceID, security.secureSecret(for: deviceID) != nil else {
+                    session.authenticated = false
                     throw RemoteError.message("Pairing required.")
                 }
                 let store = SharedFolderStore.shared

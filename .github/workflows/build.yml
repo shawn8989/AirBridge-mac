@@ -28,7 +28,7 @@ jobs:
 
       - name: Exercise the actual encrypted file client and server
         run: |
-          swiftc -parse-as-library AirBridge/SecureTransport.swift AirBridge/SecurityManager.swift AirBridge/SharedProtocol.swift AirBridge/SharedFiles.swift AirBridge/SecureFileServer.swift Tests/FileConnection.swift Tests/FileIntegrationChecks.swift -o /tmp/wield-file-integration
+          swiftc -parse-as-library AirBridge/SecureTransport.swift AirBridge/SecurityManager.swift AirBridge/SharedProtocol.swift AirBridge/EventInjector.swift AirBridge/SharedFiles.swift AirBridge/SecureFileServer.swift Tests/FileConnection.swift Tests/FileIntegrationChecks.swift -o /tmp/wield-file-integration
           /tmp/wield-file-integration
 
       - name: Build (no signing)

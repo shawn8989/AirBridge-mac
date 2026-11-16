@@ -680,7 +680,10 @@ final class NetworkManager {
                 on: NWEndpoint.Port(rawValue: WieldSecureTransport.controlPort)!)
             secureListener = listener
             listener.service = NWListener.Service(name: machineName(), type: WieldSecureTransport.serviceType)
-            listener.newConnectionHandler = { [weak self] connection in self?.handle(connection: connection, secure: true) }
+            listener.newConnectionHandler = { [weak self] connection in
+                guard let self, self.serverRunning, self.secureListenerGeneration == generation else { connection.cancel(); return }
+                self.handle(connection: connection, secure: true)
+            }
             listener.stateUpdateHandler = { [weak self] state in
                 guard let self, self.secureListenerGeneration == generation else { return }
                 if case .failed = state {

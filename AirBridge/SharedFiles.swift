@@ -124,11 +124,13 @@ final class FileTransferHandle {
     let size: Int64
     var offset: Int64 = 0
     private var committed = false
+    private var initialModified: timespec?
 
     init(download path: String, rootID: String, root: FolderDescriptor) throws {
         self.rootID = rootID; self.root = root
         fd = try root.file(path)
         var info = stat(); fstat(fd, &info)
+        initialModified = info.st_mtimespec
         size = info.st_size; name = (path as NSString).lastPathComponent
         parent = nil; temporaryName = nil
     }
@@ -152,6 +154,12 @@ final class FileTransferHandle {
     }
     func readChunk() throws -> Data {
         guard parent == nil else { throw RemoteError.message("Not a download.") }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_size == size,
+              info.st_mtimespec.tv_sec == initialModified?.tv_sec,
+              info.st_mtimespec.tv_nsec == initialModified?.tv_nsec else {
+            throw RemoteError.message("The file changed on the Mac. Retry the download.")
+        }
         var bytes = [UInt8](repeating: 0, count: 48 * 1024)
         let remaining = max(0, min(Int64(bytes.count), size - offset))
         let count = Darwin.read(fd, &bytes, Int(remaining))
