@@ -1190,7 +1190,7 @@ final class NetworkManager {
                     guard let self, let connection else { return }
                     let readiness: [String: Any] = [
                         "accessibility": AXIsProcessTrusted(),
-                        "screenRecording": CGPreflightScreenCaptureAccess(),
+                        "screenRecording": self.latestCapturedImage != nil || CGPreflightScreenCaptureAccess(),
                         "keepAvailable": UserDefaults.standard.bool(forKey: "remote.keepAvailable"),
                         "launchAtLogin": RemoteAvailability.launchAtLogin,
                         "filePort": Int(WieldSecureTransport.filePort)

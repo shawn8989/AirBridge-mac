@@ -51,13 +51,13 @@ final class FolderDescriptor {
     private let url: URL
     private let scoped: Bool
     init(url: URL) throws {
-        self.url = url
-        scoped = url.startAccessingSecurityScopedResource()
-        fd = open(url.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        if fd < 0 {
+        let scoped = url.startAccessingSecurityScopedResource()
+        let descriptor = open(url.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else {
             if scoped { url.stopAccessingSecurityScopedResource() }
             throw RemoteError.message("Cannot open the shared folder. Check its permissions on the Mac.")
         }
+        self.url = url; self.scoped = scoped; fd = descriptor
     }
     deinit { close(fd); if scoped { url.stopAccessingSecurityScopedResource() } }
 
@@ -137,13 +137,14 @@ final class FileTransferHandle {
     init(upload name: String, size: Int64, directory: String, rootID: String, root: FolderDescriptor) throws {
         let parts = try FolderDescriptor.components(name)
         guard parts.count == 1, !name.hasPrefix("."), size >= 0 else { throw RemoteError.message("Invalid upload name or size.") }
-        self.rootID = rootID; self.root = root; self.name = name; self.size = size
         let parent = try root.directory(directory)
-        self.parent = parent
         let temp = ".wield-upload-" + UUID().uuidString
-        temporaryName = temp
-        fd = openat(parent, temp, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR)
-        if fd < 0 { close(parent); throw RemoteError.message("Cannot create the upload. Check disk space and folder permissions.") }
+        let descriptor = openat(parent, temp, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else { close(parent); throw RemoteError.message("Cannot create the upload. Check disk space and folder permissions.") }
+        // Only transfer ownership after opening succeeds. A throwing initializer
+        // must not close the same directory here and again in deinit.
+        self.rootID = rootID; self.root = root; self.name = name; self.size = size
+        self.parent = parent; temporaryName = temp; fd = descriptor
     }
     deinit {
         close(fd)
@@ -154,18 +155,22 @@ final class FileTransferHandle {
     }
     func readChunk() throws -> Data {
         guard parent == nil else { throw RemoteError.message("Not a download.") }
+        try verifyUnchanged()
+        var bytes = [UInt8](repeating: 0, count: 48 * 1024)
+        let remaining = max(0, min(Int64(bytes.count), size - offset))
+        let count = Darwin.read(fd, &bytes, Int(remaining))
+        guard count >= 0, count > 0 || offset == size else { throw RemoteError.message("The file changed or could not be read. Retry the download.") }
+        try verifyUnchanged()
+        offset += Int64(count)
+        return Data(bytes.prefix(count))
+    }
+    private func verifyUnchanged() throws {
         var info = stat()
         guard fstat(fd, &info) == 0, info.st_size == size,
               info.st_mtimespec.tv_sec == initialModified?.tv_sec,
               info.st_mtimespec.tv_nsec == initialModified?.tv_nsec else {
             throw RemoteError.message("The file changed on the Mac. Retry the download.")
         }
-        var bytes = [UInt8](repeating: 0, count: 48 * 1024)
-        let remaining = max(0, min(Int64(bytes.count), size - offset))
-        let count = Darwin.read(fd, &bytes, Int(remaining))
-        guard count >= 0, count > 0 || offset == size else { throw RemoteError.message("The file changed or could not be read. Retry the download.") }
-        offset += Int64(count)
-        return Data(bytes.prefix(count))
     }
     func writeChunk(_ data: Data) throws {
         guard parent != nil, data.count <= 48 * 1024, Int64(data.count) <= size - offset else { throw RemoteError.message("Invalid upload chunk.") }
