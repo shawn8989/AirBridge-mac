@@ -183,6 +183,7 @@ private struct StatusTab: View {
                 liveCard
 
                 controlsCard
+                RemoteHostSettingsView()
             }
         }
         .scrollIndicators(.hidden)

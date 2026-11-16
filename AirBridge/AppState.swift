@@ -89,6 +89,7 @@ final class AppState: ObservableObject {
     private var networkManager: NetworkManager!
 
     init() {
+        _ = RemoteAvailability.shared
         // Single instance only: two AirBridges fight over the fixed port and
         // Bonjour registration, and both inject input — chaos. If another
         // instance is already running, bring it forward and bow out.
@@ -401,7 +402,7 @@ final class AppState: ObservableObject {
 
     /// Removes a device's pairing so its next connection requires re-approval.
     func forgetDevice(_ deviceID: String) {
-        securityManager.deleteSharedSecret(for: deviceID)
+        networkManager.revokeDevice(deviceID)
         connectedDevices.removeAll { $0.id == deviceID }
         statusMessage = "Forgot device \(deviceID.prefix(8))…"
     }

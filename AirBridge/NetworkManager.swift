@@ -33,6 +33,7 @@ private final class ConnectionBox {
     // App-layer authentication state. Commands are only executed once the
     // connection has proven knowledge of the device's shared secret.
     var authenticated = false
+    var secureTransport = false
     var authNonce: Data?
     /// Set after telling the peer once that it is not authorized, so an input
     /// stream arriving at ~120/s cannot turn into 120 error messages a second.
@@ -136,6 +137,11 @@ final class NetworkManager {
 
     private let queue = DispatchQueue(label: "AirBridge.Network")
     private var listener: NWListener?
+    private var secureListener: NWListener?
+    private var secureListenerGeneration = UUID()
+    private var serverRunning = true
+    private lazy var files = SecureFileServer(macID: machineID(), macName: machineName())
+
     private let security = SecurityManager()
     private let onReceivePacket: PacketHandler
     private let onUnknownDevice: UnknownDeviceHandler
@@ -284,6 +290,8 @@ final class NetworkManager {
     private var wakeObserverInstalled = false
 
     private func _start() {
+        serverRunning = true
+        refreshSecureListeners()
         startMetricsTimer()
         startConnectionReaper()
         #if os(macOS)
@@ -343,7 +351,7 @@ final class NetworkManager {
         }
     }
 
-    private func handle(connection: NWConnection) {
+    private func handle(connection: NWConnection, secure: Bool = false) {
         // NOTE: there is deliberately no address-based filter here.
         //
         // What used to be here read as a LAN check but ended in `|| true`, so it
@@ -361,6 +369,7 @@ final class NetworkManager {
 
         let secret = security.generateSharedSecret()
         let box = ConnectionBox(secret: secret)
+        box.secureTransport = secure
         let key = ObjectIdentifier(connection)
         connectionBoxes[key] = box
         activeConnections[key] = connection
@@ -578,12 +587,16 @@ final class NetworkManager {
     func setServerEnabled(_ enabled: Bool) {
         queue.async { [weak self] in
             guard let self else { return }
+            self.serverRunning = enabled
             if enabled {
                 guard self.listener == nil else { return }
                 self._start()
             } else {
                 self.listener?.cancel()
                 self.listener = nil
+                self.secureListener?.cancel()
+                self.secureListener = nil
+                self.files.stop()
                 // Tear each connection down PROPERLY before cancelling it.
                 // Clearing connectionBoxes here instead meant the .cancelled
                 // callback -- delivered later on this same serial queue -- hit
@@ -609,30 +622,83 @@ final class NetworkManager {
 
     // MARK: - QR pairing
     // One active QR secret at a time; valid 2 minutes or until first use.
-    private var activeQRSecret: (secret: Data, expires: Date)?
-    /// Called (on main) when a device pairs via QR so the UI can close the code.
+    private var activeQRSecret: (secret: Data, identity: String, expires: Date)?
     var onQRPaired: ((String) -> Void)?
 
-    /// Generates a fresh QR pairing secret and returns the JSON string to
-    /// encode in the QR code. Called from the UI (any thread).
     func beginQRPairing() -> String {
         let secret = security.generateNonce(length: 32)
+        let identity = "qr." + UUID().uuidString
+        let expires = Date().addingTimeInterval(120)
         queue.async { [weak self] in
-            self?.activeQRSecret = (secret, Date().addingTimeInterval(120))
+            guard let self else { return }
+            self.activeQRSecret = (secret, identity, expires)
+            self.refreshSecureListeners()
+            self.queue.asyncAfter(deadline: .now() + 120) { [weak self] in
+                guard let self, self.activeQRSecret?.identity == identity else { return }
+                self.activeQRSecret = nil
+                self.refreshSecureListeners()
+            }
         }
-        let payload: [String: Any] = [
-            "v": 1,
-            "macID": machineID(),
-            "macName": machineName(),
-            "qrSecret": secret.base64EncodedString()
-        ]
-        let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
-        return String(data: data, encoding: .utf8) ?? ""
+        let code = SecurePairingCode(v: 2, macID: machineID(), macName: machineName(),
+            qrSecret: secret.base64EncodedString(), identity: identity, expires: expires)
+        return (try? String(data: JSONEncoder().encode(code), encoding: .utf8)) ?? ""
     }
 
-    /// Invalidates any outstanding QR secret (window closed / expired).
     func cancelQRPairing() {
-        queue.async { [weak self] in self?.activeQRSecret = nil }
+        queue.async { [weak self] in
+            self?.activeQRSecret = nil
+            self?.refreshSecureListeners()
+        }
+    }
+
+    // Listener replacement does not cancel established sessions. A generation
+    // token keeps a late cancel/failure callback from replacing a newer listener.
+    private func refreshSecureListeners() {
+        secureListenerGeneration = UUID()
+        let generation = secureListenerGeneration
+        secureListener?.cancel()
+        secureListener = nil
+        guard serverRunning else { return }
+        var keys = security.secureKeys(purpose: "control")
+        if let qr = activeQRSecret, qr.expires > Date() { keys[qr.identity] = qr.secret }
+        files.restart(keys: security.secureKeys(purpose: "files"))
+        guard !keys.isEmpty else { return }
+        do {
+            let listener = try NWListener(using: WieldSecureTransport.parameters(keys: keys),
+                on: NWEndpoint.Port(rawValue: WieldSecureTransport.controlPort)!)
+            secureListener = listener
+            listener.service = NWListener.Service(name: machineName(), type: WieldSecureTransport.serviceType)
+            listener.newConnectionHandler = { [weak self] connection in self?.handle(connection: connection, secure: true) }
+            listener.stateUpdateHandler = { [weak self] state in
+                guard let self, self.secureListenerGeneration == generation else { return }
+                if case .failed = state {
+                    self.emitActivity("exclamationmark.triangle", "Secure access unavailable. Check that another Wield Host is not running.")
+                    self.queue.asyncAfter(deadline: .now() + 2) { [weak self] in
+                        guard let self, self.secureListenerGeneration == generation else { return }
+                        self.refreshSecureListeners()
+                    }
+                }
+            }
+            listener.start(queue: queue)
+        } catch {
+            emitActivity("exclamationmark.triangle", "Secure access could not start: \(error.localizedDescription)")
+        }
+    }
+
+    func revokeDevice(_ deviceID: String) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.security.deleteSecureSecret(for: deviceID)
+            self.security.deleteSharedSecret(for: deviceID)
+            let connections = self.activeConnections.filter { self.connectionBoxes[$0.key]?.deviceID == deviceID }.map(\.value)
+            for connection in connections { self.teardown(connection, reason: "device forgotten") }
+            self.files.revoke(deviceID)
+            self.refreshSecureListeners()
+        }
+    }
+
+    private func pairingSecret(for deviceID: String, secure: Bool) -> Data? {
+        secure ? security.secureSecret(for: deviceID) : (try? security.loadSharedSecret(for: deviceID))
     }
 
     private func handleLine(_ lineData: Data, from connection: NWConnection, box: ConnectionBox) {
@@ -665,6 +731,11 @@ final class NetworkManager {
                     self.emitActivity("exclamationmark.shield",
                                       "Ignoring input from an unapproved device (\(box.deviceID ?? "unknown"))")
                 }
+                return
+            }
+            if box.secureTransport && box.authenticated,
+               let id = box.deviceID, security.secureSecret(for: id) == nil {
+                teardown(connection, reason: "secure pairing revoked")
                 return
             }
             // Explicit goodbye from the phone's Disconnect button: tear down
@@ -743,7 +814,7 @@ final class NetworkManager {
                     // QR pairing: if the hello carries a proof of the currently
                     // displayed QR secret, pair without any approval dialog —
                     // scanning the code on the Mac's own screen IS the approval.
-                    if let proofB64 = payload["qrProof"] as? String,
+                    if box.secureTransport, let proofB64 = payload["qrProof"] as? String,
                        let proof = Data(base64Encoded: proofB64),
                        let qr = self.activeQRSecret, Date() < qr.expires {
                         let expected = self.security.computeHMAC(secret: qr.secret, data: Data(deviceID.utf8))
@@ -754,7 +825,7 @@ final class NetworkManager {
                             // believing it was paired and this Mac with no secret,
                             // so the next connection was an unknown device again.
                             do {
-                                try self.security.storeSharedSecret(derived, for: deviceID)
+                                try self.security.storeSecureSecret(derived, for: deviceID)
                             } catch {
                                 self.sendError("Could not save the pairing: \(error.localizedDescription)", to: connection)
                                 self.emitActivity("xmark.seal", "QR pairing failed to save — not paired")
@@ -762,6 +833,7 @@ final class NetworkManager {
                                 break
                             }
                             self.activeQRSecret = nil  // one-time use
+                            self.refreshSecureListeners()
                             box.authenticated = true
                             self.sendLine(connection, jsonObject: ["type": "pair_qr_ok", "payload": [:]])
                             self.onDeviceConnected(deviceID)
@@ -774,7 +846,7 @@ final class NetworkManager {
                         }
                     }
                     // Attempt to load existing secret
-                    if let _ = try? self.security.loadSharedSecret(for: deviceID) {
+                    if self.pairingSecret(for: deviceID, secure: box.secureTransport) != nil {
                         // Known device: require proof it holds the shared secret
                         // before authorizing. A device ID alone is not secret, so
                         // it is not sufficient — issue a random challenge.
@@ -785,6 +857,11 @@ final class NetworkManager {
                             "payload": ["nonce": nonce.base64EncodedString()]
                         ])
                     } else {
+                        if box.secureTransport {
+                            self.sendError("Scan a fresh pairing QR on your Mac to enable secure access.", to: connection)
+                            connection.cancel()
+                            return
+                        }
                         // Unknown device: ask the user to approve first-time pairing.
                         // Capture only Sendable values (NOT the non-Sendable box).
                         // onUnknownDevice is a plain completion-style callback (no
@@ -825,7 +902,7 @@ final class NetworkManager {
                       let proof = Data(base64Encoded: proofB64),
                       let deviceID = box.deviceID,
                       let nonce = box.authNonce,
-                      let secret = try? self.security.loadSharedSecret(for: deviceID) else {
+                      let secret = self.pairingSecret(for: deviceID, secure: box.secureTransport) else {
                     self.sendError("auth_proof: missing fields or unknown device", to: connection)
                     connection.cancel()
                     break
@@ -834,13 +911,14 @@ final class NetworkManager {
                 if Self.constantTimeEquals(expected, proof) {
                     box.authenticated = true
                     box.authNonce = nil
+                    self.sendLine(connection, jsonObject: ["type": "auth_ok", "payload": [:]])
                     self.onDeviceConnected(deviceID)
                 } else {
                     // Secret mismatch — almost always a stale pairing from earlier
                     // runs. Forget the stored secret and tell the client to reset,
                     // so the next connection performs a fresh pairing (with the
                     // approval prompt) instead of failing forever.
-                    self.security.deleteSharedSecret(for: deviceID)
+                    // A failed proof must not let a stranger erase a valid pairing.
                     self.sendLine(connection, jsonObject: ["type": "auth_reset", "message": "Re-pair required"])
                     connection.cancel()
                 }
@@ -1090,7 +1168,25 @@ final class NetworkManager {
                     }
                 }
                 #endif
+            case "remote_readiness":
+                guard box.secureTransport else { break }
+                DispatchQueue.main.async { [weak self, weak connection] in
+                    guard let self, let connection else { return }
+                    let readiness: [String: Any] = [
+                        "accessibility": AXIsProcessTrusted(),
+                        "screenRecording": CGPreflightScreenCaptureAccess(),
+                        "keepAvailable": UserDefaults.standard.bool(forKey: "remote.keepAvailable"),
+                        "launchAtLogin": RemoteAvailability.launchAtLogin,
+                        "filePort": Int(WieldSecureTransport.filePort)
+                    ]
+                    self.queue.async { self.sendLine(connection, jsonObject: ["type": "remote_readiness", "payload": readiness]) }
+                }
             case "pair_request":
+                guard !box.secureTransport else {
+                    self.sendError("Secure access requires scanning a new QR on the Mac.", to: connection)
+                    connection.cancel()
+                    break
+                }
                 // (Re-)pairing initiated by the client (e.g. it has no key for this
                 // Mac). Require explicit user approval, then store the new secret
                 // (replacing any stale one) and send it back so both sides match.

@@ -21,6 +21,11 @@ jobs:
           swiftc -parse-as-library AirBridge/SecureTransport.swift Tests/SecureTransportChecks.swift -o /tmp/wield-secure-checks
           /tmp/wield-secure-checks
 
+      - name: Verify shared-folder boundaries and file transfers
+        run: |
+          swiftc -parse-as-library AirBridge/SecureTransport.swift AirBridge/SharedFiles.swift Tests/SharedFileChecks.swift -o /tmp/wield-file-checks
+          /tmp/wield-file-checks
+
       - name: Build (no signing)
         run: |
           set -o pipefail
